@@ -1,0 +1,21 @@
+# IDE files
+.idea/
+
+# User data
+user_data/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.pyc
+
+# Virtual environment
+.venv/
+env/
+/data/
+data/
+data
+assets
+assets/
+logs
+logs/
