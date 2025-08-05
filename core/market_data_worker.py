@@ -137,8 +137,10 @@ class MarketDataWorker(QObject):
     def stop(self):
         """Stops the worker and closes the WebSocket connection."""
         logger.info("Stopping MarketDataWorker...")
+        # Disable reconnect attempts during a manual stop
         self.reconnect_timer.stop()
         self.heartbeat_timer.stop()
         if self.kws and self.is_running:
-            self.kws.close(1000, "Manual close")
+            # The stop() method is more forceful than close() and is better for shutdown
+            self.kws.stop()
         self.is_running = False

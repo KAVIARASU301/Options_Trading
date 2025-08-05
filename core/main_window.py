@@ -203,7 +203,6 @@ class ScalperMainWindow(QMainWindow):
         self.access_token = access_token
         self.trader = trader
         self.real_kite_client = real_kite_client
-        self.market_data_client = MarketDataWorker(api_key, access_token)
         self.trading_mode = 'paper' if isinstance(trader, PaperTradingManager) else 'live'
         self.trade_logger = TradeLogger(mode=self.trading_mode)
         self.pnl_logger = PnlLogger(mode=self.trading_mode)
@@ -232,8 +231,13 @@ class ScalperMainWindow(QMainWindow):
         self.market_monitor_dialogs = []
         self.current_symbol = ""
         self.network_status = "Initializing..."
+
+        # --- FIX: UI Throttling Implementation ---
         self._latest_market_data = {}
         self._ui_update_needed = False
+        self.ui_update_timer = QTimer(self)
+        self.ui_update_timer.timeout.connect(self._update_throttled_ui)
+        self.ui_update_timer.start(100) # Update UI at most every 100ms
 
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.custom_title_bar = CustomTitleBar(self)
@@ -254,10 +258,6 @@ class ScalperMainWindow(QMainWindow):
         self.pending_order_refresh_timer.setInterval(1000)
         self.pending_order_refresh_timer.timeout.connect(self._refresh_positions)
 
-        self.ui_update_timer = QTimer(self)
-        self.ui_update_timer.timeout.connect(self._update_throttled_ui)
-        self.ui_update_timer.start(100)
-
         self.restore_window_state()
         self.statusBar().showMessage("Loading instruments...")
 
@@ -271,13 +271,14 @@ class ScalperMainWindow(QMainWindow):
         if not self._ui_update_needed:
             return
 
-        self.strike_ladder.update_prices(list(self._latest_market_data.values()))
-        self.position_manager.update_pnl_from_market_data(list(self._latest_market_data.values()))
+        ticks_to_process = list(self._latest_market_data.values())
+        self.strike_ladder.update_prices(ticks_to_process)
+        self.position_manager.update_pnl_from_market_data(ticks_to_process)
 
         self._update_account_summary_widget()
         if self.positions_dialog and self.positions_dialog.isVisible():
             if hasattr(self.positions_dialog, 'update_market_data'):
-                self.positions_dialog.update_market_data(list(self._latest_market_data.values()))
+                self.positions_dialog.update_market_data(ticks_to_process)
 
         ladder_data = self.strike_ladder.get_ladder_data()
         if ladder_data:
@@ -536,16 +537,16 @@ class ScalperMainWindow(QMainWindow):
     def _show_market_monitor_dialog(self):
         """Creates and shows a new Market Monitor dialog instance."""
         try:
+            # FIX: Pass the shared market_data_worker to the dialog
             dialog = MarketMonitorDialog(
                 real_kite_client=self.real_kite_client,
-                api_key=self.api_key,
-                access_token=self.access_token,
+                market_data_worker=self.market_data_worker,
                 config_manager=self.config_manager,
                 parent=self
             )
 
             self.market_monitor_dialogs.append(dialog)
-            dialog.finished.connect(lambda: self._on_market_monitor_closed(dialog))
+            dialog.destroyed.connect(lambda: self._on_market_monitor_closed(dialog))
             dialog.show()
         except Exception as e:
             logger.error(f"Failed to create Market Monitor dialog: {e}", exc_info=True)
@@ -554,6 +555,8 @@ class ScalperMainWindow(QMainWindow):
     def _on_market_monitor_closed(self, dialog: QDialog):
         """Removes the market monitor dialog from the list when it's closed."""
         if dialog in self.market_monitor_dialogs:
+            # FIX: Ensure the dialog unsubscribes from symbols when closed
+            dialog.unsubscribe_all()
             self.market_monitor_dialogs.remove(dialog)
             logger.info(f"Closed a Market Monitor window. {len(self.market_monitor_dialogs)} remain open.")
 
@@ -628,21 +631,6 @@ class ScalperMainWindow(QMainWindow):
         logger.error(f"Instrument loading failed: {error}")
         QMessageBox.critical(self, "Error", f"Failed to load instruments:\n{error}")
 
-    def _on_market_data(self, data: dict):
-        self.strike_ladder.update_prices(data)
-        self.position_manager.update_pnl_from_market_data(data)
-        self._update_account_summary_widget()
-        if self.positions_dialog and self.positions_dialog.isVisible():
-            if hasattr(self.positions_dialog, 'update_market_data'):
-                self.positions_dialog.update_market_data(data)
-        ladder_data = self.strike_ladder.get_ladder_data()
-        if ladder_data:
-            atm_strike = self.strike_ladder.atm_strike
-            interval = self.strike_ladder.get_strike_interval()
-            self.buy_exit_panel.update_strike_ladder(atm_strike, interval, ladder_data)
-        if self.performance_dialog and self.performance_dialog.isVisible():
-            self._update_performance()
-
     def _get_current_price(self, symbol: str) -> Optional[float]:
         if not self.real_kite_client: return None
         try:
@@ -668,12 +656,14 @@ class ScalperMainWindow(QMainWindow):
     def _update_market_subscriptions(self):
         tokens_to_subscribe = set()
 
+        # 1. Get tokens from the strike ladder (existing logic)
         if self.strike_ladder and self.strike_ladder.contracts:
             for strike_val_dict in self.strike_ladder.contracts.values():
                 for contract_obj in strike_val_dict.values():
                     if contract_obj and contract_obj.instrument_token:
                         tokens_to_subscribe.add(contract_obj.instrument_token)
 
+        # 2. Get the underlying index token (existing logic)
         current_settings = self.header.get_current_settings()
         underlying_symbol = current_settings.get('symbol')
         if underlying_symbol and underlying_symbol in self.instrument_data:
@@ -681,11 +671,19 @@ class ScalperMainWindow(QMainWindow):
             if index_token:
                 tokens_to_subscribe.add(index_token)
 
+        # 3. Get tokens from open positions (existing logic)
         for pos in self.position_manager.get_all_positions():
             if pos.contract and pos.contract.instrument_token:
                 tokens_to_subscribe.add(pos.contract.instrument_token)
 
+        # 4. *** ADD THIS NEW LOGIC ***
+        #    Get tokens from all open market monitor dialogs.
+        for monitor_dialog in self.market_monitor_dialogs:
+            # Check if the dialog is open and has a token map
+            if monitor_dialog and hasattr(monitor_dialog, 'token_to_chart_map'):
+                tokens_to_subscribe.update(monitor_dialog.token_to_chart_map.keys())
 
+        # 5. Make the final, consolidated call
         if self.market_data_worker:
             self.market_data_worker.set_instruments(tokens_to_subscribe)
 

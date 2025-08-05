@@ -1,15 +1,17 @@
 # dialogs/market_monitor_dialog.py
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Dict, List, Set
 import pandas as pd
-from PySide6.QtCore import Qt, QByteArray, QTimer
+import numpy as np
+import pyqtgraph as pg
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QWidget,
                                QLabel, QLineEdit, QPushButton, QMessageBox, QComboBox,
-                               QSizePolicy, QFrame, QSpacerItem)
+                               QSizePolicy, QFrame, QSpacerItem, QGraphicsObject)
+from PySide6.QtCore import Qt, QByteArray, QTimer, QRectF
+from PySide6.QtGui import QFont, QPicture, QPainter
 from kiteconnect import KiteConnect
 
-from widgets.market_monitor_widget import MarketChartWidget
 from utils.config_manager import ConfigManager
 from utils.cpr_calculator import CPRCalculator
 from core.market_data_worker import MarketDataWorker
@@ -17,17 +19,264 @@ from core.market_data_worker import MarketDataWorker
 logger = logging.getLogger(__name__)
 
 
-class MarketMonitorDialog(QDialog):
-    def __init__(self, real_kite_client: KiteConnect, api_key: str, access_token: str,
-                 config_manager: ConfigManager, parent=None):
+# --- MERGED FROM market_monitor_widget.py ---
+class CandlestickItem(QGraphicsObject):
+    def __init__(self, data=None):
+        super().__init__()
+        self.data = data or []
+        # The QPicture caching is removed for efficiency
 
+    def updateData(self, data):
+        """
+        This method is called to update the data for the chart.
+        It signals that the geometry is about to change, updates the data,
+        and then schedules a repaint.
+        """
+        # Inform the graphics scene that the item's geometry will change.
+        # This is crucial for the scene to manage updates correctly.
+        self.prepareGeometryChange()
+        self.data = data
+        # Schedule a repaint of the item.
+        self.update()
+
+    # The generatePicture method is no longer needed and has been removed.
+
+    def paint(self, painter, option, widget=None):
+        """
+        The paint method is called by the graphics system to draw the item.
+        The drawing logic is now here, which is more efficient than the
+        previous QPicture caching approach for dynamic data.
+        """
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        BULL_COLOR = '#26A69A'
+        BEAR_COLOR = '#EF5350'
+        w = 0.3  # Width of the candlestick body
+
+        # The visible range can be optimized here, but for now, we draw all data.
+        for x, open_, high, low, close in self.data:
+            bullish = close >= open_
+            pen_color = BULL_COLOR if bullish else BEAR_COLOR
+            pen = pg.mkPen(color=pen_color, width=1.5)
+            painter.setPen(pen)
+
+            # Draw the high-low wick
+            painter.drawLine(x, low, x, high)
+
+            brush_color = BULL_COLOR if bullish else BEAR_COLOR
+            painter.setBrush(pg.mkBrush(brush_color))
+
+            top = max(open_, close)
+            bottom = min(open_, close)
+            height = top - bottom
+
+            # Draw the open-close body
+            painter.drawRect(QRectF(x - w, bottom, w * 2, height))
+
+    def boundingRect(self):
+        """
+        This method must return the outer bounds of the item. It is essential
+        for the graphics scene to know the item's area.
+        """
+        if not self.data:
+            return QRectF()
+
+        # Unpack all data points to find the min/max coordinates
+        xs, opens, highs, lows, closes = zip(*self.data)
+        pen_width_offset = 1  # Add a small buffer for the pen width
+
+        return QRectF(
+            min(xs) - pen_width_offset,
+            min(lows),
+            (max(xs) - min(xs)) + (2 * pen_width_offset),
+            max(highs) - min(lows)
+        )
+
+
+class MarketChartWidget(QWidget):
+    def __init__(self, parent=None, timeframe_combo=None):
+        super().__init__(parent)
+        self.timeframe_combo = timeframe_combo
+        self.symbol = ""
+        self.chart_data = pd.DataFrame()
+        self.chart_mode = 'candlestick'
+        self.day_separator_pos = None
+        self.cpr_levels = None
+        self._candlestick_item = None
+        self._line_plot = None
+        # FIX: Add a dirty flag and an update timer for throttling
+        self._data_is_dirty = False
+        self.update_timer = QTimer(self)
+        self.update_timer.timeout.connect(self._throttled_update)
+        self.update_timer.start(500)  # Update chart at most every 500ms
+
+        self._setup_ui()
+        self._setup_chart()
+        self.show_message("EMPTY", "Awaiting symbol selection")
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(4)
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(5, 2, 5, 2)
+        self.symbol_label = QLabel("NO SYMBOL")
+        self.symbol_label.setStyleSheet("font-weight: bold; font-size: 14px; color: #E0E0E0;")
+        header_layout.addWidget(self.symbol_label)
+        header_layout.addStretch()
+        button_style = ("QPushButton { font-size: 11px; background-color: #424242;"
+                        " border-radius: 4px; color: white; padding: 4px 8px; }"
+                        " QPushButton:hover { background-color: #555555; }")
+        self.mode_btn = QPushButton("Line")
+        self.mode_btn.setFixedWidth(60)
+        self.mode_btn.setToolTip("Toggle Candlestick / Line View")
+        self.mode_btn.setStyleSheet(button_style)
+        self.mode_btn.clicked.connect(self.toggle_chart_mode)
+        header_layout.addWidget(self.mode_btn)
+        layout.addLayout(header_layout)
+        self.plot_widget = pg.PlotWidget()
+        layout.addWidget(self.plot_widget)
+
+    def _setup_chart(self):
+        self.plot_widget.setBackground('#1A1A1A')
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.15)
+        self.plot_widget.setClipToView(True)
+        self.plot_widget.setDownsampling(auto=True, mode='peak')
+        self.plot_widget.setMouseEnabled(x=True, y=True)
+        self.plot_widget.enableAutoRange(axis='y', enable=True)
+        axis_pen = pg.mkPen(color='#B0B0B0', width=1)
+        font = QFont("Segoe UI", 8)
+        self.plot_widget.showAxis('right', True)
+        for axis in [self.plot_widget.getAxis('left'), self.plot_widget.getAxis('right'),
+                     self.plot_widget.getAxis('bottom')]:
+            axis.setPen(axis_pen)
+            axis.setTickFont(font)
+        self.plot_widget.getAxis('bottom').setStyle(showValues=False)
+
+    def _throttled_update(self):
+        """Only redraws the chart if new data has arrived."""
+        if self._data_is_dirty:
+            self._plot_chart_data(full_redraw=False)
+            self._data_is_dirty = False
+
+    def set_data(self, symbol: str, data: pd.DataFrame, day_separator_pos: int | None = None,
+                 cpr_levels: Dict | None = None):
+        if data.empty:
+            self.show_message(f"[{symbol}]", "No historical data available.")
+            return
+        self.symbol = symbol
+        self.chart_data = data.copy()
+        self.day_separator_pos = day_separator_pos
+        self.cpr_levels = cpr_levels
+        self.symbol_label.setText(self.symbol)
+        self._plot_chart_data(full_redraw=True)
+        self.set_visible_range("Auto")
+
+    def _draw_cpr(self):
+        if not self.cpr_levels: return
+        if 'tc' in self.cpr_levels and 'bc' in self.cpr_levels:
+            cpr_brush = pg.mkBrush(color=(0, 116, 217, 25))
+            cpr_pen = pg.mkPen(color=(0, 116, 217, 0))
+            cpr_region = pg.LinearRegionItem(
+                values=[self.cpr_levels['bc'], self.cpr_levels['tc']],
+                orientation='horizontal', brush=cpr_brush, pen=cpr_pen, movable=False
+            )
+            self.plot_widget.addItem(cpr_region)
+        if 'pivot' in self.cpr_levels:
+            pivot_pen = pg.mkPen(color='#F39C12', style=Qt.DotLine, width=1.5)
+            pivot_line = pg.InfiniteLine(pos=self.cpr_levels['pivot'], angle=0, movable=False, pen=pivot_pen)
+            self.plot_widget.addItem(pivot_line)
+
+    def _plot_chart_data(self, full_redraw=False):
+        if full_redraw:
+            self.plot_widget.clear()
+            self._candlestick_item = None # Ensures items are recreated on full redraw
+            self._line_plot = None
+            self._draw_cpr()
+            if self.day_separator_pos is not None:
+                sep = pg.InfiniteLine(pos=self.day_separator_pos - 0.5, angle=90,
+                                      pen=pg.mkPen(color='#3A4458', style=Qt.DashLine, width=1.5))
+                self.plot_widget.addItem(sep)
+
+        x = np.arange(len(self.chart_data))
+
+        if self.chart_mode == 'line':
+            if self._candlestick_item:
+                self.plot_widget.removeItem(self._candlestick_item)
+                self._candlestick_item = None
+            if self._line_plot is None:
+                self._line_plot = self.plot_widget.plot([], [], pen=pg.mkPen(width=1.5))
+            self._line_plot.setData(x, self.chart_data['close'].values)
+        else:
+            if self._line_plot:
+                self.plot_widget.removeItem(self._line_plot)
+                self._line_plot = None
+            cs_data = [(i, *self.chart_data.iloc[i][['open', 'high', 'low', 'close']].values)
+                       for i in range(len(self.chart_data))]
+            if self._candlestick_item is None:
+                self._candlestick_item = CandlestickItem(cs_data)
+                self.plot_widget.addItem(self._candlestick_item)
+            else:
+                self._candlestick_item.updateData(cs_data)
+
+    def add_tick(self, tick: dict):
+        ltp = tick.get('last_price')
+        if self.chart_data.empty or ltp is None: return
+        now = datetime.now().replace(second=0, microsecond=0)
+        tf_str = self.timeframe_combo.currentText() if self.timeframe_combo else "1min"
+        tf_minutes = int(tf_str.replace("min", ""))
+        rounded = now - timedelta(minutes=now.minute % tf_minutes)
+        if rounded in self.chart_data.index:
+            row = self.chart_data.loc[rounded]
+            self.chart_data.at[rounded, 'close'] = ltp
+            self.chart_data.at[rounded, 'high'] = max(row['high'], ltp)
+            self.chart_data.at[rounded, 'low'] = min(row['low'], ltp)
+        else:
+            last_close = self.chart_data.iloc[-1]['close']
+            new_row = pd.DataFrame([{'open': last_close, 'high': ltp, 'low': ltp, 'close': ltp}], index=[rounded])
+            self.chart_data = pd.concat([self.chart_data, new_row])
+            # No need to sort index if new rows are always appended
+        self._data_is_dirty = True
+
+    def set_visible_range(self, count_str: str):
+        if self.chart_data.empty: return
+        vb = self.plot_widget.getViewBox()
+        if count_str.lower() == 'auto':
+            vb.enableAutoRange(axis=pg.ViewBox.XAxis)
+            vb.enableAutoRange(axis=pg.ViewBox.YAxis)
+        else:
+            try:
+                count = int(count_str)
+                total = len(self.chart_data)
+                start = max(0, total - count)
+                vb.setXRange(start, total, padding=0.02)
+                vb.enableAutoRange(axis=pg.ViewBox.YAxis)
+            except Exception:
+                vb.enableAutoRange(axis=pg.ViewBox.XAxis)
+                vb.enableAutoRange(axis=pg.ViewBox.YAxis)
+
+    def toggle_chart_mode(self):
+        self.chart_mode = 'line' if self.chart_mode == 'candlestick' else 'candlestick'
+        self.mode_btn.setText("Candle" if self.chart_mode == 'line' else "Line")
+        self._plot_chart_data(full_redraw=True)
+
+    def show_message(self, title: str, message: str = ""):
+        self.plot_widget.clear()
+        self.symbol_label.setText(title)
+        if message:
+            text = pg.TextItem(message, color='#888888', anchor=(0.5, 0.5))
+            text.setFont(QFont("Segoe UI", 10))
+            self.plot_widget.addItem(text, ignoreBounds=True)
+
+
+class MarketMonitorDialog(QDialog):
+    def __init__(self, real_kite_client: KiteConnect, market_data_worker: MarketDataWorker,
+                 config_manager: ConfigManager, parent=None):
         super().__init__(parent)
         self.kite = real_kite_client
         self.config_manager = config_manager
-
-        self.market_data_worker = MarketDataWorker(api_key, access_token)
+        self.market_data_worker = market_data_worker
         self.market_data_worker.data_received.connect(self._on_ticks_received)
-        self.market_data_worker.start()
 
         self.charts: List[MarketChartWidget] = []
         self.token_to_chart_map: Dict[int, MarketChartWidget] = {}
@@ -48,6 +297,7 @@ class MarketMonitorDialog(QDialog):
         self._restore_state()
 
         self.symbols_entry.setText("NIFTY 50, NIFTY BANK, FINNIFTY, SENSEX")
+        print("[MarketMonitor] Init complete")
         QTimer.singleShot(100, self._load_charts_data)
 
     def _setup_window(self):
@@ -55,7 +305,7 @@ class MarketMonitorDialog(QDialog):
         self.setWindowFlags(Qt.Window | Qt.WindowMinMaxButtonsHint | Qt.WindowCloseButtonHint)
         self.resize(1200, 700)
         self.setMinimumSize(960, 600)
-        self.setObjectName("MarketMonitorDialog")  # Set object name for specific styling
+        self.setObjectName("MarketMonitorDialog")
 
     def _fetch_and_build_symbol_map(self):
         try:
@@ -157,94 +407,38 @@ class MarketMonitorDialog(QDialog):
         self.set_selector_combo.currentIndexChanged.connect(self._on_set_selected)
         self.candle_count_combo.currentTextChanged.connect(self._on_candle_count_changed)
         self.timeframe_combo.currentTextChanged.connect(self._load_charts_data)
-        if self.market_data_worker:
-            self.market_data_worker.data_received.connect(self._on_ticks_received)
 
     def _apply_styles(self):
-        """Applies a custom dark theme stylesheet to the dialog."""
         STYLE_SHEET = """
-        QDialog#MarketMonitorDialog {
-            background-color: #2C2C2C;
-        }
-
-        QLabel {
-            color: #E0E0E0;
-            font-size: 12px;
-        }
-
-        /* Style for Buttons */
+        QDialog#MarketMonitorDialog { background-color: #2C2C2C; }
+        QLabel { color: #E0E0E0; font-size: 12px; }
         QPushButton {
-            background-color: #424242;
-            color: #FFFFFF;
-            border: 1px solid #555555;
-            padding: 6px 14px;
-            border-radius: 4px;
-            font-size: 12px;
-            font-weight: bold;
+            background-color: #424242; color: #FFFFFF; border: 1px solid #555555;
+            padding: 6px 14px; border-radius: 4px; font-size: 12px; font-weight: bold;
         }
-        QPushButton:hover {
-            background-color: #555555;
-            border: 1px solid #666666;
-        }
-        QPushButton:pressed {
-            background-color: #383838;
-        }
-        QPushButton:disabled {
-            background-color: #3A3A3A;
-            color: #888888;
-            border-color: #444444;
-        }
-
-        /* Style for Dropdown Menus */
+        QPushButton:hover { background-color: #555555; border: 1px solid #666666; }
+        QPushButton:pressed { background-color: #383838; }
+        QPushButton:disabled { background-color: #3A3A3A; color: #888888; border-color: #444444; }
         QComboBox {
-            background-color: #424242;
-            color: #E0E0E0;
-            border: 1px solid #555555;
-            padding: 6px;
-            padding-left: 12px;
-            border-radius: 4px;
-            font-size: 12px;
+            background-color: #424242; color: #E0E0E0; border: 1px solid #555555;
+            padding: 6px; padding-left: 12px; border-radius: 4px; font-size: 12px;
         }
-        QComboBox:hover {
-            border: 1px solid #666666;
-        }
+        QComboBox:hover { border: 1px solid #666666; }
         QComboBox::drop-down {
-            subcontrol-origin: padding;
-            subcontrol-position: top right;
-            width: 22px;
-            border-left-width: 1px;
-            border-left-color: #555555;
-            border-left-style: solid;
-            border-top-right-radius: 3px;
-            border-bottom-right-radius: 3px;
+            subcontrol-origin: padding; subcontrol-position: top right; width: 22px;
+            border-left-width: 1px; border-left-color: #555555; border-left-style: solid;
+            border-top-right-radius: 3px; border-bottom-right-radius: 3px;
         }
         QComboBox QAbstractItemView {
-            background-color: #3A3A3A;
-            color: #E0E0E0;
-            border: 1px solid #555555;
-            selection-background-color: #007ACC;
-            outline: 0px;
+            background-color: #3A3A3A; color: #E0E0E0; border: 1px solid #555555;
+            selection-background-color: #007ACC; outline: 0px;
         }
-
-        /* Style for Text Input */
         QLineEdit {
-            background-color: #3A3A3A;
-            color: #E0E0E0;
-            border: 1px solid #555555;
-            border-radius: 4px;
-            padding: 7px;
-            font-size: 12px;
+            background-color: #3A3A3A; color: #E0E0E0; border: 1px solid #555555;
+            border-radius: 4px; padding: 7px; font-size: 12px;
         }
-        QLineEdit:focus {
-            border: 1px solid #007ACC;
-        }
-
-        /* Style for the Separator Line */
-        QFrame[frameShape="4"] { /* QFrame.HLine */
-            border: none;
-            height: 1px;
-            background-color: #4A4A4A;
-        }
+        QLineEdit:focus { border: 1px solid #007ACC; }
+        QFrame[frameShape="4"] { border: none; height: 1px; background-color: #4A4A4A; }
         """
         self.setStyleSheet(STYLE_SHEET)
 
@@ -258,7 +452,7 @@ class MarketMonitorDialog(QDialog):
             chart.set_visible_range(text)
 
     def _load_charts_data(self):
-        self._unsubscribe_all()
+        self.unsubscribe_all()
         self.token_to_chart_map.clear()
         symbols = [s.strip() for s in self.symbols_entry.text().strip().split(',') if s.strip()]
         if not symbols: return
@@ -281,21 +475,28 @@ class MarketMonitorDialog(QDialog):
         self.load_button.setEnabled(True)
         self.load_button.setText("Load Charts")
 
-    def _on_ticks_received(self, ticks: List[Dict]):
+    def _on_ticks_received(self, ticks: list[dict]):
         for tick in ticks:
-            logger.debug(f"MarketMonitor Tick: {tick}")
-            if chart := self.token_to_chart_map.get(tick.get('instrument_token')):
+            token = tick.get("instrument_token")
+            if token in self.token_to_chart_map:
+                chart = self.token_to_chart_map[token]
                 chart.add_tick(tick)
+                print(f"Tick routed to {chart.symbol}: LTP = {tick.get('last_price')}")
 
-    def _subscribe_to(self, tokens: set):
-        if self.market_data_worker:
-            # Force-set instruments instead of union (fix for frozen charts)
-            self.market_data_worker.set_instruments(tokens)
-            logger.info(f"Subscribed to tokens: {tokens}")
+    def _subscribe_to(self, tokens: Set[int]):
+        if not tokens:
+            return
+        self.market_data_worker.set_instruments(tokens, append=True)  # ✅ FIXED
+        logger.info(f"Market Monitor subscribed to tokens: {tokens}")
 
-    def _unsubscribe_all(self):
-        if self.market_data_worker and self.token_to_chart_map: self.market_data_worker.set_instruments(
-            self.market_data_worker.subscribed_tokens - set(self.token_to_chart_map.keys()))
+    def unsubscribe_all(self):
+        if self.market_data_worker and self.token_to_chart_map:
+            print("[MarketMonitor] unsubscribe_all called")
+            tokens_to_remove = set(self.token_to_chart_map.keys())
+            current_subs = self.market_data_worker.subscribed_tokens
+            self.market_data_worker.set_instruments(current_subs - tokens_to_remove)
+            logger.info(f"Market Monitor unsubscribed from tokens: {tokens_to_remove}")
+            self.token_to_chart_map.clear()
 
     def _load_and_populate_sets(self):
         self.symbol_sets = self.config_manager.load_market_monitor_sets()
@@ -329,5 +530,6 @@ class MarketMonitorDialog(QDialog):
                                                   self.saveGeometry().toBase64().data().decode('utf-8'))
         except Exception as e:
             logger.error(f"Failed to save dialog state: {e}")
-        self._unsubscribe_all()
+        print("[MarketMonitor] Dialog closed")
+        self.market_data_worker.data_received.disconnect(self._on_ticks_received)
         super().closeEvent(event)
