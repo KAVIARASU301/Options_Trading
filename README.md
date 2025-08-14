@@ -5,7 +5,6 @@ Hey there! Welcome to the Options Scalper project. This is a trading application
 This started as a personal project to build a tool that fit my own trading style, but I'm sharing it here in case it's useful to anyone else. It's built with Python and the PySide6 (Qt) library for the user interface.
 
 ## What's Inside?
-g
 * **Live Market Data:** Hooks directly into the Kite API to get real-time ticks.
 * **Strike Ladder:** A central part of the UI that shows a ladder of option strikes with live prices, making it easy to see what's happening around the current price.
 * **Quick Trading:** Panels for quickly buying and selling calls/puts, and for exiting positions with a single click.
