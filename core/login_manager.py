@@ -3,6 +3,9 @@ import logging
 import webbrowser
 from typing import Optional, Dict
 
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QMessageBox, QWidget, QStackedWidget,
     QCheckBox, QFrame
@@ -27,9 +30,61 @@ class LoginWorker(QThread):
 
     def run(self):
         try:
-            kite = KiteConnect(api_key=self.api_key,timeout=20)
+            kite = KiteConnect(api_key=self.api_key, timeout=20)
             data = kite.generate_session(self.request_token, api_secret=self.api_secret)
             self.success.emit(data.get('access_token'))
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class RequestTokenServer(QThread):
+    """
+    Lightweight local HTTP server that listens once for:
+        http://127.0.0.1:5678/kite_callback?request_token=...
+    Then emits token_received and exits.
+    """
+    token_received = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 5678, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.host = host
+        self.port = port
+
+    def run(self):
+        outer_self = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                try:
+                    parsed = urlparse(self.path)
+                    qs = parse_qs(parsed.query)
+                    token = qs.get("request_token", [None])[0]
+
+                    # Simple success page in browser
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(
+                        b"<html><body style='font-family:Segoe UI,sans-serif;background:#111;color:#eee;text-align:center;padding-top:40px;'>"
+                        b"<h2>Login successful</h2>"
+                        b"<p>You can now return to Options Scalper Pro.</p>"
+                        b"</body></html>"
+                    )
+
+                    if token:
+                        outer_self.token_received.emit(token)
+                except Exception as e:
+                    outer_self.error.emit(str(e))
+
+            # Silence default console logging
+            def log_message(self, format, *args):
+                return
+
+        try:
+            httpd = HTTPServer((self.host, self.port), Handler)
+            # Handle just ONE request, then return
+            httpd.handle_request()
         except Exception as e:
             self.error.emit(str(e))
 
@@ -45,6 +100,8 @@ class LoginManager(QDialog):
         self.api_secret = ""
         self.access_token = None
         self.trading_mode = 'live'
+
+        self.token_server: Optional[RequestTokenServer] = None
 
         self.setWindowTitle("Options Scalper Pro - Authentication")
         self.setMinimumSize(420, 450)
@@ -62,6 +119,8 @@ class LoginManager(QDialog):
         self._apply_styles()
 
         QTimer.singleShot(100, self._try_auto_login)
+
+    # ---------------- UI SETUP ---------------- #
 
     def _setup_ui(self):
         # Main container for rounded corners and background
@@ -177,11 +236,14 @@ class LoginManager(QDialog):
         token_title = QLabel("Complete Authentication")
         token_title.setObjectName("dialogTitle")
 
-        token_info = QLabel("After logging in, copy the 'request_token' from your browser's URL and paste it below.")
+        token_info = QLabel(
+            "Your browser will redirect back to this app.\n"
+            "If auto-detection fails, copy the 'request_token' from the URL and paste it below."
+        )
         token_info.setWordWrap(True)
 
         self.request_token_input = QLineEdit()
-        self.request_token_input.setPlaceholderText("Paste request_token here...")
+        self.request_token_input.setPlaceholderText("Paste request_token here (fallback)...")
 
         self.generate_button = QPushButton("Generate Session")
         self.generate_button.setObjectName("primaryButton")
@@ -194,7 +256,8 @@ class LoginManager(QDialog):
         layout.addWidget(self.generate_button)
         return page
 
-    # Add mouse events to make the frameless window draggable
+    # ---------------- DRAGGABLE WINDOW ---------------- #
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
@@ -209,7 +272,8 @@ class LoginManager(QDialog):
         self._drag_pos = None
         event.accept()
 
-    # --- Methods for logic (no changes needed) ---
+    # ---------------- LOGIC METHODS ---------------- #
+
     def _try_auto_login(self):
         creds = self.token_manager.load_credentials()
         if creds:
@@ -242,6 +306,10 @@ class LoginManager(QDialog):
         self.stacked_widget.setCurrentIndex(1)
 
     def _on_mode_selected(self, mode: str):
+        """
+        User selected Live/Paper after entering API key/secret.
+        Start local callback server, open Kite login URL, go to token page.
+        """
         self.trading_mode = mode
         self.api_key = self.api_key_input.text().strip()
         self.api_secret = self.api_secret_input.text().strip()
@@ -253,12 +321,44 @@ class LoginManager(QDialog):
         if self.save_creds_checkbox.isChecked():
             self.token_manager.save_credentials(self.api_key, self.api_secret)
 
+        # Start local server to capture request_token
+        try:
+            self.token_server = RequestTokenServer(parent=self)
+            self.token_server.token_received.connect(self._on_request_token_auto)
+            self.token_server.error.connect(self._on_token_server_error)
+            self.token_server.start()
+            logger.info("Started local RequestTokenServer on 127.0.0.1:5678")
+        except Exception as e:
+            logger.error(f"Failed to start RequestTokenServer: {e}")
+            QMessageBox.warning(
+                self,
+                "Callback Server Error",
+                "Could not start local callback server.\n"
+                "You may need to paste the request_token manually."
+            )
+
         try:
             kite = KiteConnect(api_key=self.api_key)
             webbrowser.open_new(kite.login_url())
             self.stacked_widget.setCurrentIndex(2)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not initiate login: {e}")
+
+    def _on_token_server_error(self, msg: str):
+        logger.error(f"RequestTokenServer error: {msg}")
+
+    def _on_request_token_auto(self, token: str):
+        """
+        Called when the local HTTP server captures the request_token
+        from the browser redirect.
+        """
+        if not token:
+            return
+
+        logger.info("Automatically captured request_token from browser redirect.")
+        self.request_token_input.setText(token)
+        # Directly proceed to generate the session
+        self._on_complete_login()
 
     def _on_complete_login(self):
         request_token = self.request_token_input.text().strip()
@@ -304,6 +404,8 @@ class LoginManager(QDialog):
     def get_trading_mode(self) -> Optional[str]:
         return self.trading_mode
 
+    # ---------------- STYLES ---------------- #
+
     def _apply_styles(self):
         """Applies a premium, modern dark theme."""
         self.setStyleSheet("""
@@ -315,18 +417,18 @@ class LoginManager(QDialog):
             }
             #appTitle {
                 font-size: 24px;
-                font-weight: 300; /* Lighter font weight */
+                font-weight: 300;
                 color: #E0E0E0;
                 padding-bottom: 5px;
             }
             #dialogTitle {
                 font-size: 18px;
-                font-weight: 600; /* Bolder */
+                font-weight: 600;
                 color: #FFFFFF;
                 padding-bottom: 15px;
             }
             #infoLabel {
-                color: #8A9BA8; /* Muted text color */
+                color: #8A9BA8;
                 font-size: 13px;
             }
             #divider {
@@ -334,7 +436,7 @@ class LoginManager(QDialog):
                 height: 1px;
             }
             QLabel {
-                color: #A9B1C3; /* Standard label color */
+                color: #A9B1C3;
                 font-size: 13px;
             }
             QLineEdit {
@@ -346,28 +448,17 @@ class LoginManager(QDialog):
                 padding: 10px;
             }
             QLineEdit:focus {
-                border: 1px solid #29C7C9; /* Highlight color */
+                border: 1px solid #29C7C9;
             }
             QCheckBox {
                 color: #A9B1C3;
                 spacing: 8px;
             }
-            QCheckBox::indicator {
-                width: 16px;
-                height: 16px;
-                border-radius: 4px;
-                background-color: #2A3140;
-                border: 1px solid #3A4458;
-            }
-            QCheckBox::indicator:checked {
-                background-color: #29C7C9;
-                image: url(check.png); /* You might need a checkmark icon */
-            }
             QPushButton {
-                font-weight: bold;
+                padding: 10px 14px;
                 border-radius: 6px;
-                padding: 12px;
                 font-size: 14px;
+                font-weight: 500;
             }
             #primaryButton {
                 background-color: #29C7C9;
@@ -378,22 +469,21 @@ class LoginManager(QDialog):
                 background-color: #32E0E3;
             }
             #secondaryButton {
-                background-color: transparent;
-                color: #A9B1C3;
-                border: 1px solid #3A4458;
+                background-color: #3A4458;
+                color: #E0E0E0;
+                border: none;
             }
             #secondaryButton:hover {
-                background-color: #212635;
-                border-color: #A9B1C3;
+                background-color: #4A5568;
             }
             #linkButton {
+                background-color: transparent;
                 color: #8A9BA8;
                 border: none;
-                font-weight: normal;
-                font-size: 12px;
                 text-decoration: underline;
+                font-size: 12px;
             }
             #linkButton:hover {
-                color: #E0E0E0;
+                color: #FFFFFF;
             }
         """)
