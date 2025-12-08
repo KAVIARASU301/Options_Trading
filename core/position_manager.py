@@ -166,6 +166,7 @@ class PositionManager(QObject):
         if expired_count > 0:
             self._emit_all()
 
+
     def update_pnl_from_market_data(self, data: Union[dict, list]):
         updated = False
         ticks = data if isinstance(data, list) else [data]
@@ -179,20 +180,36 @@ class PositionManager(QObject):
                     pos.update_pnl(ltp)
                     updated = True
 
-            if pos.stop_loss_price is not None and pos.pnl <= -pos.stop_loss_price:
-                self.exit_position(pos)
+            # ===== FIX: Check LTP against price levels, not P&L =====
 
-            if pos.target_price is not None and pos.pnl >= pos.target_price:
-                self.exit_position(pos)
+            # Stop Loss Check - Exit if LTP goes BELOW stop loss price (for long positions)
+            if pos.stop_loss_price is not None and pos.quantity > 0:
+                if pos.ltp <= pos.stop_loss_price:
+                    logger.info(
+                        f"Stop Loss triggered for {pos.tradingsymbol}: LTP {pos.ltp} <= SL {pos.stop_loss_price}")
+                    self.exit_position(pos)
+                    continue  # Skip further checks for this position
 
+            # Target Check - Exit if LTP goes ABOVE target price (for long positions)
+            if pos.target_price is not None and pos.quantity > 0:
+                if pos.ltp >= pos.target_price:
+                    logger.info(f"Target reached for {pos.tradingsymbol}: LTP {pos.ltp} >= TP {pos.target_price}")
+                    self.exit_position(pos)
+                    continue  # Skip further checks for this position
+
+            # Trailing Stop Loss Logic
             if pos.trailing_stop_loss and pos.stop_loss_order_id and pos.stop_loss_price:
                 pnl_points = (pos.ltp - pos.average_price)
+
                 if pnl_points > 0:
                     current_trail_level = (pos.average_price - pos.stop_loss_price) // pos.trailing_stop_loss
                     new_trail_level = pnl_points // pos.trailing_stop_loss
+
                     if new_trail_level > current_trail_level:
                         new_sl_price = pos.stop_loss_price + (
                                 new_trail_level - current_trail_level) * pos.trailing_stop_loss
+                        logger.info(
+                            f"Trailing SL update for {pos.tradingsymbol}: {pos.stop_loss_price} -> {new_sl_price}")
                         self.modify_stop_loss(pos.tradingsymbol, new_sl_price)
 
         if updated:

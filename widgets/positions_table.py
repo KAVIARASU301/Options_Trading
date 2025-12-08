@@ -311,21 +311,28 @@ class PositionsTable(QWidget):
         sl_price = pos_data.get('stop_loss_price')
         tp_price = pos_data.get('target_price')
         tsl = pos_data.get('trailing_stop_loss')
+        avg_price = pos_data.get('average_price', 0.0)
+        quantity = abs(pos_data.get('quantity', 0))
 
-        # Create formatted info text
+        # Create formatted info text with amounts and price levels
         info_parts = []
+
         if sl_price and sl_price > 0:
-            info_parts.append(f"SL: {sl_price:.0f}")
+            sl_amount = abs(avg_price - sl_price) * quantity
+            info_parts.append(f"SL: ₹{sl_amount:.0f} ({sl_price:.2f})")
+
         if tp_price and tp_price > 0:
-            info_parts.append(f"TP: {tp_price:.0f}")
+            tp_amount = abs(tp_price - avg_price) * quantity
+            info_parts.append(f"Target: ₹{tp_amount:.0f} ({tp_price:.2f})")
+
         if tsl and tsl > 0:
-            info_parts.append(f"TSL: {tsl:.0f}")
+            info_parts.append(f"TSL: ₹{tsl:.0f}")
 
-        info_text = "   " + " • ".join(info_parts)  # Indent with spaces
+        info_text = " • ".join(info_parts)
 
-        # Set the info text in the symbol column, spanning across
+        # Set the info text in the first column, but span across ALL columns
         item = QTableWidgetItem(info_text)
-        item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)  # or AlignLeft if you prefer
         item.setFlags(item.flags() & ~Qt.ItemIsEditable)
 
         # Style the info row
@@ -336,12 +343,8 @@ class PositionsTable(QWidget):
 
         self.table.setItem(row, self.SYMBOL_COL, item)
 
-        # Set empty items for other columns to maintain structure
-        for col in [self.QUANTITY_COL, self.AVG_PRICE_COL, self.LTP_COL, self.PNL_COL]:
-            empty_item = QTableWidgetItem("")
-            empty_item.setFlags(empty_item.flags() & ~Qt.ItemIsEditable)
-            empty_item.setBackground(QColor("#1A1F2B"))  # Slightly different background
-            self.table.setItem(row, col, empty_item)
+        # Span this cell across all columns so the text uses full width
+        self.table.setSpan(row, self.SYMBOL_COL, 1, self.table.columnCount())
 
     def _load_column_widths(self):
         """Load saved column widths from JSON file"""

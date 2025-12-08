@@ -262,19 +262,19 @@ class HeaderToolbar(QFrame):
             }
             #iconButton:hover { color: #FFFFFF; }
             #dangerButton {
-    background-color: rgba(0, 0, 0, 0); /* Transparent but valid in QSS */
-    color: #F85149;
-    font-weight: bold;
-    border: 1px solid #F85149;
-    border-radius: 3px;
-    padding: 5px 14px;
-    font-size: 11px;
-}
-
-#dangerButton:hover {
-    background-color: #F85149;
-    color: #161A25;
-}
-
-
-        """)
+            background-color: rgba(0, 0, 0, 0); /* Transparent but valid in QSS */
+            color: #F85149;
+            font-weight: bold;
+            border: 1px solid #F85149;
+            border-radius: 3px;
+            padding: 5px 14px;
+            font-size: 11px;
+        }
+        
+        #dangerButton:hover {
+            background-color: #F85149;
+            color: #161A25;
+        }
+        
+        
+                """)
