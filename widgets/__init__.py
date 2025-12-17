@@ -7,6 +7,5 @@ from .performance_widget import PerformanceWidget
 
 __all__ = [
     'AccountSummaryWidget',
-    'OrderStatusWidget',
-    'PerformanceWidget'
+    'OrderStatusWidget'
 ]

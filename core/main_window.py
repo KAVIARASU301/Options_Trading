@@ -205,7 +205,7 @@ class ScalperMainWindow(QMainWindow):
         self.real_kite_client = real_kite_client
         self.trading_mode = 'paper' if isinstance(trader, PaperTradingManager) else 'live'
         self.trade_logger = TradeLogger(mode=self.trading_mode)
-        self.pnl_logger = PnlLogger(mode=self.trading_mode)
+        # self.pnl_logger = PnlLogger(mode=self.trading_mode)
         self.position_manager = PositionManager(self.trader, self.trade_logger)
         self.config_manager = ConfigManager()
         self.instrument_data = {}
@@ -881,32 +881,21 @@ class ScalperMainWindow(QMainWindow):
 
     def _show_performance_dialog(self):
         if self.performance_dialog is None:
-            self.performance_dialog = PerformanceDialog(mode=self.trading_mode, parent=self)
+            self.performance_dialog = PerformanceDialog(
+                mode=self.trading_mode,
+                parent=self
+            )
+            self.performance_dialog.finished.connect(
+                lambda: setattr(self, 'performance_dialog', None)
+            )
 
-        all_trades = self.trade_logger.get_all_trades()
-        completed_trades = [trade for trade in all_trades if trade.get('pnl', 0.0) != 0.0]
-        total_pnl = sum(trade.get('pnl', 0.0) for trade in completed_trades)
-        winning_trades = [trade for trade in completed_trades if trade.get('pnl', 0.0) > 0]
-        losing_trades = [trade for trade in completed_trades if trade.get('pnl', 0.0) < 0]
-
-        total_completed_trades = len(completed_trades)
-        metrics = {
-            'total_trades': total_completed_trades,
-            'winning_trades': len(winning_trades),
-            'losing_trades': len(losing_trades),
-            'total_pnl': total_pnl,
-            'win_rate': (len(winning_trades) / total_completed_trades * 100) if total_completed_trades else 0,
-            'avg_profit': (sum(t.get('pnl', 0.0) for t in winning_trades) / len(
-                winning_trades)) if winning_trades else 0.0,
-            'avg_loss': abs(
-                sum(t.get('pnl', 0.0) for t in losing_trades) / len(losing_trades)) if losing_trades else 0.0,
-        }
-        self.performance_dialog.update_metrics(metrics)
+        # Let the dialog pull data from the PnL database itself
+        self.performance_dialog.refresh()
 
         self.performance_dialog.show()
         self.performance_dialog.raise_()
         self.performance_dialog.activateWindow()
-
+        
     def _update_pending_order_widgets(self, pending_orders: List[Dict]):
         screen_geometry = self.screen().availableGeometry()
         spacing = 10

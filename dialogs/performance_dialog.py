@@ -1,255 +1,363 @@
 import logging
-import json
 from datetime import datetime
-from pathlib import Path
 
-import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, Signal  # Import Signal
-from PySide6.QtGui import QMouseEvent
+from pyqtgraph import DateAxisItem
+from PySide6.QtCore import Qt, Signal, QPoint
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QDialog,
-    QHBoxLayout,
-    QGridLayout,
-    QLabel,
-    QPushButton,
-    QVBoxLayout,
-    QWidget,
+    QDialog, QWidget, QLabel, QPushButton,
+    QVBoxLayout, QHBoxLayout, QGridLayout
 )
+
+from utils.pnl_logger import PnlLogger
 
 logger = logging.getLogger(__name__)
 
 
 class PerformanceDialog(QDialog):
     """
-    An advanced, professional dialog to display trading performance.
+    Professional Performance Dashboard
+    Single source of truth: PnlLogger
     """
-    # FIX: Add a signal that the main window can connect to.
+
     refresh_requested = Signal()
 
-    def __init__(self, mode: str = "live", parent=None):
-        super().__init__(parent)
-        self._drag_pos = None
-        self.mode = mode.lower()
-        if self.mode not in ["live", "paper"]:
-            logger.warning(f"Invalid mode '{self.mode}' provided. Defaulting to 'live'.")
-            self.mode = "live"
+    # ------------------------------------------------------------------
+    # Tooltips (KEYED BY METRIC KEY — NOT UI TEXT)
+    # ------------------------------------------------------------------
+    METRIC_TOOLTIPS = {
+        "total_pnl": "Total profit or loss accumulated across all trading days.",
+        "expectancy": "Average profit per trade.\nPositive expectancy means the system has an edge.",
+        "win_rate": "Percentage of trades that ended in profit.",
+        "profit_factor": "Total profit divided by total loss.\nAbove 1.5 is considered healthy.",
 
+        "avg_win": "Average profit from winning trades.",
+        "avg_loss": "Average loss from losing trades.",
+        "rr_ratio": "Risk–Reward Ratio.\nHow much you gain compared to how much you lose.",
+        "rr_quality": "Human-friendly evaluation of Risk–Reward quality.",
+
+        "total_trades": "Total number of completed trades.",
+        "consistency": "Percentage of days that ended in profit.\nMeasures stability, not accuracy.",
+        "best_day": "Highest profit achieved in a single trading day.",
+        "worst_day": "Largest loss incurred in a single trading day."
+    }
+
+    # ------------------------------------------------------------------
+
+    def __init__(self, mode="live", parent=None):
+        super().__init__(parent)
+
+        self.mode = mode.lower()
+        self.pnl_logger = PnlLogger(mode=self.mode)
+        self._drag_pos: QPoint | None = None
+
+        self.setWindowTitle("Performance Dashboard")
+        self.setMinimumSize(1000, 720)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setWindowTitle(f"{self.mode.capitalize()} Performance Dashboard")
-        self.setMinimumSize(800, 650)
 
-        self._init_ui()
+        self._setup_ui()
         self._connect_signals()
         self._apply_styles()
 
-        self._plot_equity_curve(self._load_pnl_history())
-        self.update_metrics({})
+        self.refresh()
 
-    def _get_history_filepath(self) -> Path:
-        history_dir = Path(__file__).parent / "pnl_history"
-        history_dir.mkdir(parents=True, exist_ok=True)
-        return history_dir / f"{self.mode}_pnl_history.json"
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
 
-    def _init_ui(self):
-        container = QWidget(self)
-        container.setObjectName("mainContainer")
+    def _setup_ui(self):
+        self.container = QWidget(self)
+        self.container.setObjectName("mainContainer")
 
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.addWidget(container)
+        main_layout.addWidget(self.container)
 
-        container_layout = QVBoxLayout(container)
-        container_layout.setContentsMargins(20, 10, 20, 20)
-        container_layout.setSpacing(20)
+        layout = QVBoxLayout(self.container)
+        layout.setContentsMargins(22, 14, 22, 22)
+        layout.setSpacing(18)
 
-        container_layout.addLayout(self._create_header())
-        grid_layout = self._create_metrics_grid()
-        container_layout.addLayout(grid_layout)
+        layout.addLayout(self._create_header())
+        layout.addLayout(self._create_metrics_grid())
+        layout.addWidget(self._create_chart(), 1)
 
-        self.chart_widget = self._create_chart_widget()
-        container_layout.addWidget(self.chart_widget, 1)
+    def _create_header(self):
+        layout = QHBoxLayout()
 
-    def _create_header(self) -> QHBoxLayout:
-        header_layout = QHBoxLayout()
-        header_layout.setContentsMargins(0, 0, 0, 0)
-        title = QLabel(f"{self.mode.capitalize()} Performance")
+        title = QLabel("PERFORMANCE DASHBOARD")
         title.setObjectName("dialogTitle")
 
-        self.refresh_btn = QPushButton("Refresh")
+        mode_badge = QLabel(self.mode.upper())
+        mode_badge.setObjectName("modeBadge")
+
+        self.refresh_btn = QPushButton("REFRESH")
         self.refresh_btn.setObjectName("navButton")
 
         self.close_btn = QPushButton("✕")
         self.close_btn.setObjectName("closeButton")
 
-        header_layout.addWidget(title)
-        header_layout.addStretch()
-        header_layout.addWidget(self.refresh_btn)
-        header_layout.addWidget(self.close_btn)
-        return header_layout
+        layout.addWidget(title)
+        layout.addWidget(mode_badge)
+        layout.addStretch()
+        layout.addWidget(self.refresh_btn)
+        layout.addWidget(self.close_btn)
 
-    def _connect_signals(self):
-        """Connects UI element signals to corresponding slots."""
-        self.close_btn.clicked.connect(self.close)
-        # FIX: Make the refresh button emit our new signal.
-        self.refresh_btn.clicked.connect(self.refresh_requested)
+        return layout
 
-    # ... (The rest of the file remains the same, but the sample data method is now gone)
-    # FIX: The _refresh_with_sample_data method has been completely removed.
+    def _create_metrics_grid(self):
+        grid = QGridLayout()
+        grid.setSpacing(14)
 
-    def _create_chart_widget(self) -> pg.PlotWidget:
-        date_axis = pg.DateAxisItem(orientation='bottom')
-        plot_widget = pg.PlotWidget(axisItems={'bottom': date_axis})
-
-        plot_widget.setBackground("transparent")
-        plot_widget.showGrid(x=True, y=True, alpha=0.2)
-        plot_widget.getPlotItem().hideButtons()
-
-        axis_pen = pg.mkPen(color="#B0BEC5", width=1)
-        plot_widget.getAxis('left').setPen(axis_pen)
-        plot_widget.getAxis('bottom').setPen(axis_pen)
-        plot_widget.getAxis('left').setTextPen(axis_pen.color())
-        plot_widget.getAxis('bottom').setTextPen(axis_pen.color())
-
-        plot_widget.setLabel('left', "Total P&L (₹)", color="#B0BEC5")
-        plot_widget.setLabel('bottom', "Date", color="#B0BEC5")
-
-        return plot_widget
-
-    def _create_metrics_grid(self) -> QGridLayout:
-        grid_layout = QGridLayout()
-        grid_layout.setSpacing(15)
         self.labels = {}
 
-        self.labels['total_pnl'] = self._create_metric_widget("All-Time P&L", grid_layout, 0, 0)
-        self.labels['win_rate'] = self._create_metric_widget("Win Rate", grid_layout, 0, 1)
-        self.labels['avg_profit'] = self._create_metric_widget("Average Win", grid_layout, 0, 2)
-        self.labels['avg_loss'] = self._create_metric_widget("Average Loss", grid_layout, 0, 3)
-        self.labels['risk_reward_ratio'] = self._create_metric_widget("Risk/Reward Ratio", grid_layout, 1, 0)
-        self.labels['total_trades'] = self._create_metric_widget("Total Trades", grid_layout, 1, 1)
-        self.labels['winning_trades'] = self._create_metric_widget("Winning Trades", grid_layout, 1, 2)
-        self.labels['losing_trades'] = self._create_metric_widget("Losing Trades", grid_layout, 1, 3)
-        return grid_layout
+        metrics = [
+            ("Total P&L", "total_pnl"),
+            ("Expectancy", "expectancy"),
+            ("Win Rate", "win_rate"),
+            ("Profit Factor", "profit_factor"),
 
-    @staticmethod
-    def _create_metric_widget(title_text, layout, row, col) -> QLabel:
-        metric_box = QWidget()
-        metric_box.setObjectName("metricFrame")
-        metric_layout = QVBoxLayout(metric_box)
-        metric_layout.setContentsMargins(15, 12, 15, 12)
-        metric_layout.setSpacing(5)
+            ("Avg Win", "avg_win"),
+            ("Avg Loss", "avg_loss"),
+            ("Risk–Reward", "rr_ratio"),
+            ("RR Quality", "rr_quality"),
 
-        value_label = QLabel("N/A")
-        value_label.setObjectName("metricValueLabel")
-        title_label = QLabel(title_text)
-        title_label.setObjectName("metricTitleLabel")
+            ("Total Trades", "total_trades"),
+            ("Consistency", "consistency"),
+            ("Best Day", "best_day"),
+            ("Worst Day", "worst_day"),
+        ]
 
-        metric_layout.addWidget(title_label, 0, Qt.AlignTop)
-        metric_layout.addWidget(value_label, 1, Qt.AlignBottom)
+        for i, (title, key) in enumerate(metrics):
+            row, col = divmod(i, 4)
+            self.labels[key] = self._metric_card(grid, title, key, row, col)
 
-        layout.addWidget(metric_box, row, col)
-        return value_label
+        return grid
 
-    def _load_pnl_history(self) -> dict:
-        filepath = self._get_history_filepath()
-        if not filepath.exists():
-            return {}
-        try:
-            with open(filepath, "r") as f:
-                content = f.read()
-                if not content: return {}
-                return json.loads(content)
-        except (json.JSONDecodeError, IOError) as e:
-            logger.error(f"Failed to load P&L history from {filepath}: {e}")
-            return {}
+    def _metric_card(self, layout, title, metric_key, row, col):
+        card = QWidget()
+        card.setObjectName("metricCard")
 
-    def _update_pnl_history(self, current_pnl: float) -> dict:
-        history = self._load_pnl_history()
-        today_str = datetime.now().strftime('%Y-%m-%d')
-        history[today_str] = current_pnl
-        filepath = self._get_history_filepath()
-        try:
-            with open(filepath, "w") as f:
-                json.dump(history, f, indent=4)
-        except IOError as e:
-            logger.error(f"Failed to save P&L history to {filepath}: {e}")
-        return history
+        # ✅ TOOLTIP FIX — USE METRIC KEY DIRECTLY
+        tooltip = self.METRIC_TOOLTIPS.get(metric_key)
+        if tooltip:
+            card.setToolTip(tooltip)
 
-    def _plot_equity_curve(self, pnl_history: dict):
-        self.chart_widget.clear()
-        if not pnl_history:
+        v = QVBoxLayout(card)
+        v.setContentsMargins(14, 12, 14, 12)
+        v.setSpacing(6)
+
+        title_lbl = QLabel(title)
+        title_lbl.setObjectName("metricTitle")
+
+        value_lbl = QLabel("—")
+        value_lbl.setObjectName("metricValue")
+        value_lbl.setAlignment(Qt.AlignCenter)
+        value_lbl.setFont(QFont("Segoe UI", 15, QFont.Weight.Bold))
+
+        v.addWidget(title_lbl)
+        v.addWidget(value_lbl)
+
+        layout.addWidget(card, row, col)
+        return value_lbl
+
+    # ------------------------------------------------------------------
+    # CHART
+    # ------------------------------------------------------------------
+
+    def _create_chart(self):
+        axis = DateAxisItem(orientation="bottom")
+        chart = pg.PlotWidget(axisItems={"bottom": axis})
+        chart.setBackground("#161A25")
+        chart.showGrid(x=True, y=True, alpha=0.25)
+        chart.setLabel("left", "Cumulative P&L (₹)")
+        chart.setLabel("bottom", "Date")
+
+        chart.getAxis("bottom").setTickSpacing(
+            major=86400 * 7,
+            minor=86400
+        )
+
+        self.chart = chart
+        return chart
+
+    # ------------------------------------------------------------------
+    # DATA
+    # ------------------------------------------------------------------
+
+    def refresh(self):
+        pnl = self.pnl_logger.get_all_pnl()
+        self._update_metrics(pnl)
+        self._plot_equity(pnl)
+
+    def _update_metrics(self, pnl: dict):
+        if not pnl:
             return
-        try:
-            sorted_history = sorted(pnl_history.items(), key=lambda x: datetime.strptime(x[0], '%Y-%m-%d'))
-            dates = [datetime.strptime(item[0], '%Y-%m-%d').timestamp() for item in sorted_history]
-            pnl_values = [item[1] for item in sorted_history]
-            self.chart_widget.plot(x=dates, y=pnl_values, pen=pg.mkPen(color="#1DE9B6", width=2))
-        except (ValueError, TypeError) as e:
-            logger.error(f"Error plotting equity curve with data {pnl_history}: {e}")
 
-    def update_metrics(self, metrics: dict):
-        profit_color, loss_color = "#1DE9B6", "#F85149"
-        pnl_history = self._load_pnl_history()
-        if 'total_pnl' in metrics:
-            total_pnl = metrics.get('total_pnl', 0.0)
-            pnl_history = self._update_pnl_history(total_pnl)
-        else:
-            if pnl_history:
-                last_date = max(pnl_history.keys())
-                total_pnl = pnl_history.get(last_date, 0.0)
-            else:
-                total_pnl = 0.0
-        self._plot_equity_curve(pnl_history)
-        pnl_label = self.labels.get('total_pnl')
-        if pnl_label:
-            pnl_label.setText(f"₹{int(total_pnl):,}")
-            pnl_label.setStyleSheet(f"color: {profit_color if total_pnl >= 0 else loss_color};")
-        win_rate = metrics.get('win_rate', 0.0)
-        win_rate_label = self.labels.get('win_rate')
-        if win_rate_label:
-            win_rate_label.setText(f"{win_rate:.1f}%")
-            win_rate_label.setStyleSheet(f"color: {profit_color if win_rate >= 50 else loss_color};")
-        self.labels.get('winning_trades', QLabel()).setText(str(metrics.get('winning_trades', 'N/A')))
-        self.labels.get('losing_trades', QLabel()).setText(str(metrics.get('losing_trades', 'N/A')))
-        self.labels.get('total_trades', QLabel()).setText(str(metrics.get('total_trades', 'N/A')))
-        avg_profit = metrics.get('avg_profit', 0.0)
-        self.labels.get('avg_profit', QLabel()).setText(f"₹{int(avg_profit):,}")
-        avg_loss = metrics.get('avg_loss', 0.0)
-        self.labels.get('avg_loss', QLabel()).setText(f"₹{int(avg_loss):,}")
-        rr_label = self.labels.get('risk_reward_ratio')
-        if rr_label and avg_profit is not None and avg_loss is not None and avg_loss != 0:
-            ratio = abs(avg_profit / avg_loss)
-            if ratio < 1: rating, color = "(Bad)", loss_color
-            elif 1 <= ratio < 2: rating, color = "(Not Bad)", "#F39C12"
-            else: rating, color = "(Good)", profit_color
-            rr_label.setText(f"{ratio:.2f} : 1  <span style='color:{color};'>{rating}</span>")
-        elif rr_label:
-            rr_label.setText("N/A")
+        values = list(pnl.values())
+        wins = [v for v in values if v > 0]
+        losses = [v for v in values if v < 0]
+
+        total = len(values)
+        total_pnl = sum(values)
+        win_rate = (len(wins) / total) * 100 if total else 0
+
+        avg_win = sum(wins) / len(wins) if wins else 0
+        avg_loss = abs(sum(losses) / len(losses)) if losses else 0
+
+        rr = avg_win / avg_loss if avg_loss else 0
+        expectancy = (win_rate / 100) * avg_win - ((100 - win_rate) / 100) * avg_loss
+        profit_factor = sum(wins) / abs(sum(losses)) if losses else float("inf")
+        consistency = (len(wins) / total) * 100 if total else 0
+
+        rr_quality = (
+            "Poor" if rr < 1 else
+            "Not Bad" if rr < 1.5 else
+            "Good" if rr < 2 else
+            "Very Good"
+        )
+
+        def setv(key, text, color):
+            lbl = self.labels[key]
+            lbl.setText(text)
+            lbl.setStyleSheet(f"color:{color};")
+
+        setv("total_pnl", f"₹{total_pnl:,.0f}", "#29C7C9" if total_pnl >= 0 else "#F85149")
+        setv("expectancy", f"₹{expectancy:,.0f}", "#00D1B2" if expectancy >= 0 else "#F85149")
+        setv("win_rate", f"{win_rate:.1f}%", "#4CAF50" if win_rate >= 50 else "#F39C12")
+        setv("profit_factor", f"{profit_factor:.2f}", "#4CAF50" if profit_factor >= 1.5 else "#F39C12")
+
+        setv("avg_win", f"₹{avg_win:,.0f}", "#4CAF50")
+        setv("avg_loss", f"₹{avg_loss:,.0f}", "#F85149")
+        setv("rr_ratio", f"{rr:.2f}", "#29C7C9")
+        setv("rr_quality", rr_quality,
+             "#00D1B2" if rr >= 2 else "#29C7C9" if rr >= 1.5 else "#F39C12")
+
+        setv("total_trades", str(total), "#E0E0E0")
+        setv("consistency", f"{consistency:.1f}%", "#4CAF50" if consistency >= 50 else "#F39C12")
+        setv("best_day", f"₹{max(values):,.0f}", "#4CAF50")
+        setv("worst_day", f"₹{min(values):,.0f}", "#F85149")
+
+    def _plot_equity(self, pnl: dict):
+        self.chart.clear()
+
+        xs, ys = [], []
+        running = 0.0
+
+        for d, p in sorted(pnl.items()):
+            running += p
+            xs.append(datetime.strptime(d, "%Y-%m-%d").timestamp())
+            ys.append(running)
+
+        if not xs:
+            return
+
+        # Zero line
+        self.chart.addItem(
+            pg.InfiniteLine(pos=0, angle=0, pen=pg.mkPen("#3A4458", style=Qt.DashLine))
+        )
+
+        # Main soft equity line
+        self.chart.plot(
+            xs, ys,
+            pen=pg.mkPen("#9ADFE0", width=1.6),
+            antialias=True
+        )
+
+        # Area fills
+        self.chart.plot(xs, [y if y > 0 else 0 for y in ys],
+                        pen=None, fillLevel=0,
+                        fillBrush=pg.mkBrush(41, 199, 201, 55))
+
+        self.chart.plot(xs, [y if y < 0 else 0 for y in ys],
+                        pen=None, fillLevel=0,
+                        fillBrush=pg.mkBrush(248, 81, 73, 55))
+
+    # ------------------------------------------------------------------
+    # DRAG SUPPORT
+    # ------------------------------------------------------------------
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag_pos = e.globalPosition().toPoint()
+
+    def mouseMoveEvent(self, e):
+        if self._drag_pos:
+            delta = e.globalPosition().toPoint() - self._drag_pos
+            self.move(self.pos() + delta)
+            self._drag_pos = e.globalPosition().toPoint()
+
+    def mouseReleaseEvent(self, e):
+        self._drag_pos = None
+
+    # ------------------------------------------------------------------
+    # SIGNALS & STYLE
+    # ------------------------------------------------------------------
+
+    def _connect_signals(self):
+        self.refresh_btn.clicked.connect(self.refresh)
+        self.close_btn.clicked.connect(self.close)
 
     def _apply_styles(self):
         self.setStyleSheet("""
-            #mainContainer { background-color: #161A25; border: 1px solid #3A4458; border-radius: 12px; font-family: "Segoe UI", sans-serif; }
-            #dialogTitle { color: #FFFFFF; font-size: 18px; font-weight: 600; }
-            #closeButton, #navButton { background-color: transparent; border: 1px solid #3A4458; color: #A9B1C3; font-size: 12px; font-weight: bold; border-radius: 4px; padding: 6px 12px; }
-            #closeButton:hover { background-color: #F85149; color: white; border-color: #F85149; }
-            #navButton:hover { background-color: #29C7C9; color: #161A25; border-color: #29C7C9; }
-            #metricFrame { background: #212635; border: 1px solid #3A4458; border-radius: 8px; }
-            #metricFrame:hover { border-color: rgba(29, 233, 182, 0.6); }
-            #metricTitleLabel { color: #B0BEC5; font-size: 10px; font-weight: 700; text-transform: uppercase; background: transparent; }
-            #metricValueLabel { color: #FFFFFF; font-size: 20px; font-weight: 600; font-family: 'Segoe UI', 'Roboto Mono', monospace; background: transparent; }
+            QToolTip {
+                background-color: #212635;
+                color: #E0E0E0;
+                border: 1px solid #3A4458;
+                border-radius: 6px;
+                padding: 6px 8px;
+                font-size: 11px;
+            }
+            #mainContainer {
+                background-color: #161A25;
+                border: 1px solid #3A4458;
+                border-radius: 14px;
+            }
+            #dialogTitle {
+                color: #FFFFFF;
+                font-size: 18px;
+                font-weight: 600;
+            }
+            #modeBadge {
+                background-color: #212635;
+                border: 1px solid #3A4458;
+                border-radius: 6px;
+                padding: 4px 10px;
+                color: #29C7C9;
+                font-size: 11px;
+                font-weight: bold;
+            }
+            #metricCard {
+                background-color: #212635;
+                border: 1px solid #3A4458;
+                border-radius: 10px;
+            }
+            #metricTitle {
+                color: #A9B1C3;
+                font-size: 11px;
+            }
+            #metricValue {
+                color: #FFFFFF;
+            }
+            #closeButton {
+                background: transparent;
+                border: none;
+                color: #8A9BA8;
+                font-size: 16px;
+            }
+            #closeButton:hover {
+                color: #FFFFFF;
+            }
+            QPushButton#navButton {
+                background-color: #212635;
+                border: 1px solid #3A4458;
+                border-radius: 6px;
+                padding: 6px 14px;
+                color: #E0E0E0;
+            }
+            QPushButton#navButton:hover {
+                background-color: #29C7C9;
+                color: #161A25;
+            }
         """)
-
-    def mousePressEvent(self, event: QMouseEvent):
-        if event.button() == Qt.LeftButton:
-            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            event.accept()
-
-    def mouseMoveEvent(self, event: QMouseEvent):
-        if event.buttons() == Qt.LeftButton and self._drag_pos:
-            self.move(event.globalPosition().toPoint() - self._drag_pos)
-            event.accept()
-
-    def mouseReleaseEvent(self, event: QMouseEvent):
-        self._drag_pos = None
-        event.accept()
