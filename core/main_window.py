@@ -398,6 +398,13 @@ class ScalperMainWindow(QMainWindow):
                     order_data['pnl'] = realized_pnl
 
             self.trade_logger.log_trade(order_data)
+            # 🔊 PLAY SOUND FOR SL / TARGET EXIT
+            if transaction_type == self.trader.TRANSACTION_TYPE_SELL:
+                pnl = order_data.get('pnl', 0.0)
+                if pnl < 0:
+                    self._play_sound(success=False)
+                else:
+                    self._play_sound(success=True)
 
             logger.debug("Paper trade complete, triggering immediate account info refresh.")
             self._update_account_info()
@@ -1198,21 +1205,22 @@ class ScalperMainWindow(QMainWindow):
             self._execute_bulk_exit(positions_to_exit)
 
     def _execute_bulk_exit(self, positions_list: List[Position]):
-        successful_exits = 0
-        failed_exits_info = []
-
         if not positions_list:
             return
 
-        self.statusBar().showMessage(f"Exiting {len(positions_list)} positions...", 1000)
+        self.statusBar().showMessage(f"Exiting {len(positions_list)} positions...", 2000)
+
         for pos_to_exit in positions_list:
             try:
                 exit_quantity = abs(pos_to_exit.quantity)
                 if exit_quantity == 0:
-                    logger.info(f"Skipping exit for {pos_to_exit.tradingsymbol} as quantity is zero.")
                     continue
 
-                transaction_type = self.trader.TRANSACTION_TYPE_SELL if pos_to_exit.quantity > 0 else self.trader.TRANSACTION_TYPE_BUY
+                transaction_type = (
+                    self.trader.TRANSACTION_TYPE_SELL
+                    if pos_to_exit.quantity > 0
+                    else self.trader.TRANSACTION_TYPE_BUY
+                )
 
                 order_id = self.trader.place_order(
                     variety=self.trader.VARIETY_REGULAR,
@@ -1223,48 +1231,52 @@ class ScalperMainWindow(QMainWindow):
                     product=pos_to_exit.product,
                     order_type=self.trader.ORDER_TYPE_MARKET,
                 )
+
                 logger.info(
-                    f"Bulk exit order placed for {pos_to_exit.tradingsymbol} (Qty: {exit_quantity}) -> Order ID: {order_id}")
-
-                if not isinstance(self.trader, PaperTradingManager):
-                    import time
-                    time.sleep(0.5)
-                    confirmed_order = self._confirm_order_success(order_id)
-                    if confirmed_order:
-                        exit_price = confirmed_order.get('average_price', pos_to_exit.ltp)
-                        realized_pnl = (exit_price - pos_to_exit.average_price) * abs(pos_to_exit.quantity)
-
-                        confirmed_order['pnl'] = realized_pnl
-                        self.trade_logger.log_trade(confirmed_order)
-                        self.pnl_logger.log_pnl(datetime.now(), realized_pnl)
-                        successful_exits += 1
-                    else:
-                        logger.warning(
-                            f"Bulk exit order {order_id} for {pos_to_exit.tradingsymbol} could not be confirmed.")
-                        failed_exits_info.append((pos_to_exit.tradingsymbol, "Order not confirmed"))
-                else:
-                    successful_exits += 1
+                    f"Bulk exit order placed for {pos_to_exit.tradingsymbol} "
+                    f"(Qty: {exit_quantity}) -> Order ID: {order_id}"
+                )
 
             except Exception as e:
-                logger.error(f"Bulk exit failed for {pos_to_exit.tradingsymbol}: {e}", exc_info=True)
-                failed_exits_info.append((pos_to_exit.tradingsymbol, str(e)))
+                # NOTE: Do NOT mark bulk exit as failed here
+                logger.error(
+                    f"Bulk exit order placement error for {pos_to_exit.tradingsymbol}: {e}",
+                    exc_info=True
+                )
 
-        self._play_sound(success=not failed_exits_info)
-
-        if failed_exits_info:
-            error_summary = f"Successfully placed exit orders for {successful_exits} positions.\n"
-            error_summary += f"Failed to place exit orders for {len(failed_exits_info)} positions:\n"
-            for sym, err_str in failed_exits_info[:3]:
-                error_summary += f"  • {sym}: {err_str}\n"
-            if len(failed_exits_info) > 3:
-                error_summary += f"  ... and {len(failed_exits_info) - 3} more failures.\n"
-            QMessageBox.warning(self, "Bulk Exit Results", error_summary)
-            self.statusBar().showMessage(f"Bulk exit: {successful_exits} succeeded, {len(failed_exits_info)} failed.",
-                                         7000)
-        else:
-            self.statusBar().showMessage(f"All {successful_exits} positions queued for exit successfully.", 5000)
-
+        # Refresh positions after all exit requests
         self._refresh_positions()
+
+        # Final decision MUST be state-based, not API-response-based
+        QTimer.singleShot(1500, self._finalize_bulk_exit_result)
+
+    def _finalize_bulk_exit_result(self):
+        remaining_positions = [
+            p for p in self.position_manager.get_all_positions()
+            if p.quantity != 0
+        ]
+
+        if not remaining_positions:
+            self.statusBar().showMessage(
+                "All positions exited successfully.", 5000
+            )
+            self._play_sound(success=True)
+            logger.info("Bulk exit completed successfully — no open positions remaining.")
+        else:
+            symbols = ", ".join(p.tradingsymbol for p in remaining_positions[:5])
+            QMessageBox.warning(
+                self,
+                "Partial Exit",
+                (
+                    "Some positions are still open:\n\n"
+                    f"{symbols}\n\n"
+                    "Please review them manually."
+                )
+            )
+            self._play_sound(success=False)
+            logger.warning(
+                f"Bulk exit incomplete — remaining positions: {symbols}"
+            )
 
     def _exit_position(self, position_data_to_exit: dict):
         tradingsymbol = position_data_to_exit.get('tradingsymbol')

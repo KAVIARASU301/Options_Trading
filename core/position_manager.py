@@ -35,6 +35,7 @@ class PositionManager(QObject):
         self._pending_orders: List[Dict] = []
         self.last_refresh_time: Optional[datetime] = None
         self._refresh_in_progress = False
+        self._exit_in_progress: set[str] = set()
 
         mode = 'paper' if isinstance(self.trader, PaperTradingManager) else 'live'
         self.pnl_logger = PnlLogger(mode=mode)
@@ -95,7 +96,7 @@ class PositionManager(QObject):
                         pos.stop_loss_price = existing_pos.stop_loss_price
                         pos.target_price = existing_pos.target_price
                         pos.trailing_stop_loss = existing_pos.trailing_stop_loss
-                        pos.is_exiting = False
+                        pos.is_exiting = pos.tradingsymbol in self._exit_in_progress
                     current_positions[pos.tradingsymbol] = pos
 
         self._synchronize_positions(current_positions)
@@ -153,10 +154,13 @@ class PositionManager(QObject):
         new_symbols = set(new_positions.keys())
 
         for symbol in old_symbols - new_symbols:
-            exited_pos = self._positions.pop(symbol)
+            exited_pos = self._positions.pop(symbol, None)
+            if not exited_pos:
+                continue
             if exited_pos.pnl is not None:
                 self.realized_day_pnl += exited_pos.pnl
-                self.pnl_logger.log_pnl(datetime.today(), exited_pos.pnl)
+                self.pnl_logger.log_pnl(datetime.now(), exited_pos.pnl)
+            self._exit_in_progress.discard(symbol)
             self.position_removed.emit(symbol)
 
         self._positions = new_positions
@@ -170,15 +174,19 @@ class PositionManager(QObject):
         ticks = data if isinstance(data, list) else [data]
         ticks_by_token = {tick['instrument_token']: tick for tick in ticks}
 
-        for pos in self._positions.values():
+        for pos in list(self._positions.values()):
+
+
+            if pos.is_exiting:
+                continue
+
             if pos.contract and pos.contract.instrument_token in ticks_by_token:
                 tick = ticks_by_token[pos.contract.instrument_token]
                 ltp = tick.get('last_price', pos.ltp)
+
                 if abs(pos.ltp - ltp) > 1e-9:
                     pos.update_pnl(ltp)
                     updated = True
-
-            # ===== FIX: Check LTP against price levels, not P&L =====
 
             # Stop Loss Check - Exit if LTP goes BELOW stop loss price (for long positions)
             if pos.stop_loss_price is not None and pos.quantity > 0:
@@ -221,9 +229,13 @@ class PositionManager(QObject):
         self._emit_all()
 
     def exit_position(self, position: Position):
-        if position.is_exiting:
+        symbol = position.tradingsymbol
+
+        if symbol in self._exit_in_progress:
+            logger.info(f"Exit already in progress for {symbol}")
             return
 
+        self._exit_in_progress.add(symbol)
         position.is_exiting = True
 
         try:
@@ -237,15 +249,32 @@ class PositionManager(QObject):
                 order_type=self.trader.ORDER_TYPE_MARKET,
             )
             logger.info(f"Exit order placed for {position.tradingsymbol}")
+
+            # ✅ IMMEDIATE LOCAL CLEANUP (THIS FIXES FREEZE)
+            exited_pos = self._positions.pop(symbol, None)
+            if exited_pos:
+                if exited_pos.pnl is not None:
+                    self.realized_day_pnl += exited_pos.pnl
+                    self.pnl_logger.log_pnl(datetime.now(), exited_pos.pnl)
+
+                self.position_removed.emit(symbol)
+                self.positions_updated.emit(self.get_all_positions())
+                self.refresh_completed.emit(True)
+
+            self._exit_in_progress.discard(symbol)
+
         except Exception as e:
+            logger.error(f"Exit failed for {symbol}: {e}")
             position.is_exiting = False
-            logger.error(f"Exit failed for {position.tradingsymbol}: {e}")
+            self._exit_in_progress.discard(symbol)
 
     def remove_position(self, tradingsymbol: str):
-        if tradingsymbol in self._positions:
-            exited_pos = self._positions.pop(tradingsymbol)
-            self.position_removed.emit(tradingsymbol)
-            self._emit_all()
+        exited_pos = self._positions.pop(tradingsymbol, None)
+        if not exited_pos:
+            return
+
+        self.position_removed.emit(tradingsymbol)
+        self._emit_all()
 
     def get_all_positions(self) -> List[Position]:
         return list(self._positions.values())
@@ -317,7 +346,7 @@ class PositionManager(QObject):
     ):
         position = self.get_position(tradingsymbol)
         if not position:
-            logger.error(f"Position not found for SL/TP update: {tradingsymbol}")
+            logger.warning(f"SL/TP update ignored — position already closed: {tradingsymbol}")
             return
 
         position.stop_loss_price = sl_price if sl_price and sl_price > 0 else None
