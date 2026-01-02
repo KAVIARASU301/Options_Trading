@@ -2,90 +2,106 @@
 
 import logging
 from datetime import datetime
-from typing import Dict, Iterable
+from typing import Dict, Iterable, Optional
 
+from PySide6.QtCore import QObject, Signal
 from core.cvd.cvd_state import CVDState
 
 logger = logging.getLogger(__name__)
 
 
-class CVDEngine:
+class CVDEngine(QObject):
     """
-    Computes Cumulative Volume Delta (CVD) from live ticks.
+    Tick-driven CVD engine.
+    Emits signal whenever CVD changes.
+    """
 
-    Logic:
-    - Uses volume delta between ticks
-    - Uses price change to infer buy/sell aggression
-    - Resets daily (session-based)
-    """
+    cvd_updated = Signal(int, float)  # instrument_token, cvd_value
 
     def __init__(self):
-        self._states: Dict[str, CVDState] = {}
+        super().__init__()
+        self._states: Dict[int, CVDState] = {}
+        self._last_log_time: Dict[int, float] = {}
 
-    def get_state(self, symbol: str) -> CVDState:
-        if symbol not in self._states:
-            self._states[symbol] = CVDState(symbol=symbol)
-        return self._states[symbol]
+    def register_token(self, token: int):
+        """Explicitly register a token for CVD tracking."""
+        if token not in self._states:
+            self._states[token] = CVDState(instrument_token=token)
+            logger.info(f"[CVD] Registered token {token}")
 
     def process_ticks(self, ticks: Iterable[dict]):
-        """
-        Process a batch of ticks from MarketDataWorker.
-        """
+        """Process multiple ticks."""
         for tick in ticks:
             self._process_single_tick(tick)
 
     def _process_single_tick(self, tick: dict):
-        symbol = tick.get("tradingsymbol")
+        """Process a single tick and update CVD."""
+        token = tick.get("instrument_token")
         price = tick.get("last_price")
-        volume = tick.get("volume_traded")
+        volume = tick.get("volume")
 
-        if not symbol or price is None or volume is None:
+        if token is None or price is None or volume is None:
             return
 
-        state = self.get_state(symbol)
+        # Get or create state
+        state = self._states.get(token)
+        if not state:
+            return  # Only process registered tokens
 
+        # Session management
         today = datetime.now().date()
-
-        # Session reset (like anchor = 1D in TradingView)
         if state.session_date != today:
             state.reset_session(today)
+            logger.info(f"[CVD] Session reset for token {token}")
 
-        # First tick bootstrap
-        if state.last_price is None or state.last_volume is None:
+        # Initialize on first tick
+        if state.last_volume is None:
             state.last_price = price
             state.last_volume = volume
+            self.cvd_updated.emit(token, state.cvd)
             return
 
+        # Calculate volume delta
         volume_delta = volume - state.last_volume
-        price_delta = price - state.last_price
 
-        # Ignore invalid or zero volume changes
-        if volume_delta <= 0:
-            state.last_price = price
-            state.last_volume = volume
-            return
+        # Update CVD if volume increased
+        if volume_delta > 0:
+            if price >= state.last_price:
+                state.cvd += volume_delta
+            else:
+                state.cvd -= volume_delta
 
-        # Aggression inference (same idea as requestVolumeDelta)
-        if price_delta > 0:
-            state.cvd += volume_delta
-        elif price_delta < 0:
-            state.cvd -= volume_delta
-        # else: flat price → ignore
+            # Emit signal
+            self.cvd_updated.emit(token, state.cvd)
 
+            # Throttled logging (every 2 seconds per token)
+            current_time = datetime.now().timestamp()
+            last_log = self._last_log_time.get(token, 0)
+            if current_time - last_log >= 2.0:
+                logger.debug(
+                    f"[CVD] token={token} cvd={state.cvd:,.0f} "
+                    f"delta={volume_delta:+,d} price={price:.2f}"
+                )
+                self._last_log_time[token] = current_time
+
+        # Update state
         state.last_price = price
         state.last_volume = volume
 
-    def snapshot(self) -> Dict[str, float]:
-        """
-        Returns a lightweight snapshot for UI.
-        """
-        return {symbol: state.cvd for symbol, state in self._states.items()}
+    def get_cvd(self, token: int) -> Optional[float]:
+        """Get current CVD value for a token."""
+        state = self._states.get(token)
+        return state.cvd if state else None
 
-    def ensure_symbol(self, symbol: str):
-        self.get_state(symbol)
+    def snapshot(self) -> Dict[int, float]:
+        """Get snapshot of all CVD values."""
+        return {
+            token: state.cvd
+            for token, state in self._states.items()
+        }
 
-    def get_cvd(self, symbol: str) -> float | None:
-        state = self._states.get(symbol)
-        if not state:
-            return None
-        return state.cvd
+    def clear_token(self, token: int):
+        """Remove a token from tracking."""
+        if token in self._states:
+            del self._states[token]
+            logger.info(f"[CVD] Cleared token {token}")

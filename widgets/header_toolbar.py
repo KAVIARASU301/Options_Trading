@@ -32,7 +32,7 @@ class HeaderToolbar(QFrame):
 
     def _setup_ui(self):
         """Initialize the toolbar UI components."""
-        self.setFixedHeight(50)
+        self.setFixedHeight(46)
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(15, 0, 15, 0)
         main_layout.setSpacing(15)
@@ -216,11 +216,16 @@ class HeaderToolbar(QFrame):
         """Applies a premium, modern dark theme stylesheet."""
         self.setStyleSheet("""
             HeaderToolbar {
-                background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                                  stop:0 #2A3140, stop:1 #161A25);
-                border-bottom: 1px solid #0D0F15;
+                background-color: qlineargradient(
+                    x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #1F2533,
+                    stop:1 #141925
+                );
+                border-top: 1px solid #0D0F15;      /* visually connects to menu bar */
+                border-bottom: 1px solid #0B0E14;   /* anchors content below */
                 font-family: "Segoe UI";
             }
+
             #separator {
                 width: 1px;
                 background-color: #3A4458;
@@ -228,25 +233,36 @@ class HeaderToolbar(QFrame):
                 margin: 8px 0px;
             }
             #quickAccessButton {
-                color: #8A9BA8; border: none; background-color: transparent;
-                font-weight: 600; font-size: 13px;
-                padding: 4px 8px;
-                border-bottom: 3px solid transparent;
+                color: #8A9BA8;
+                background-color: transparent;
+                border: none;
+                font-weight: 600;
+                font-size: 13px;
+                padding: 6px 10px;
+                border-radius: 6px;
             }
-            #quickAccessButton:hover { color: #E0E0E0; }
+            #quickAccessButton:hover {
+                background-color: rgba(255, 255, 255, 0.04);
+                color: #E0E0E0;
+            }
             #quickAccessButton:checked {
+                background-color: rgba(41, 199, 201, 0.15);
                 color: #FFFFFF;
-                border-bottom: 3px solid #29C7C9;
             }
+
             #controlLabel {
                 color: #A9B1C3; font-size: 11px; font-weight: bold;
             }
             QComboBox, QSpinBox {
-                background-color: #212635; color: #E0E0E0;
-                border: 1px solid #3A4458; border-radius: 5px;
-                padding: 5px 8px;
-                font-size: 13px; font-weight: 500;
+                background-color: #212635;
+                color: #E0E0E0;
+                border: 1px solid #3A4458;
+                border-radius: 5px;
+                padding: 4px 8px;
+                font-size: 13px;
+                font-weight: 500;
             }
+
             QComboBox:focus, QSpinBox:focus { border-color: #29C7C9; }
             QComboBox::drop-down { border: none; }
             #statusLabel {

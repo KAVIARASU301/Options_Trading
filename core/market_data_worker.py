@@ -1,4 +1,4 @@
-# core/market_data_worker.py
+# core/market_data_worker.py - COMPLETE FIXED VERSION
 
 import logging
 from typing import Set, Optional
@@ -49,7 +49,7 @@ class MarketDataWorker(QObject):
         self.kws.on_close = self._on_close
         self.kws.on_error = self._on_error
 
-        # The connected call is non-blocking and runs in its own thread
+        # The connect call is non-blocking and runs in its own thread
         self.kws.connect(threaded=True)
         self.is_running = True
 
@@ -58,7 +58,7 @@ class MarketDataWorker(QObject):
             if datetime.now() - self.last_tick_time > timedelta(seconds=30):
                 logger.warning("Heartbeat: No ticks received in the last 30 seconds. Assuming disconnection.")
                 if self.kws:
-                    self.kws.stop() # Force stop the websocket
+                    self.kws.stop()
                 self._on_close(self.kws, 1001, "Heartbeat Timeout")
 
     def _on_ticks(self, _, ticks):
@@ -73,10 +73,17 @@ class MarketDataWorker(QObject):
         self.reconnect_attempts = 0
         self.last_tick_time = datetime.now()
         self.reconnect_timer.stop()
-        QTimer.singleShot(0, lambda: self.heartbeat_timer.start(15000)) # Check every 15 seconds
+        QTimer.singleShot(0, lambda: self.heartbeat_timer.start(15000))
+
+        # 🔥 FIX: Subscribe to any queued tokens
         if self.subscribed_tokens:
-            self.kws.subscribe(list(self.subscribed_tokens))
-            self.kws.set_mode(self.kws.MODE_FULL, list(self.subscribed_tokens))
+            token_list = list(self.subscribed_tokens)
+            try:
+                self.kws.subscribe(token_list)
+                self.kws.set_mode(self.kws.MODE_FULL, token_list)
+                logger.info(f"Subscribed to {len(token_list)} tokens on connect.")
+            except Exception as e:
+                logger.error(f"Failed to subscribe on connect: {e}")
 
     def _on_close(self, _, code, reason):
         """Callback on connection close."""
@@ -86,7 +93,7 @@ class MarketDataWorker(QObject):
         self.connection_status_changed.emit("Disconnected")
         self.connection_closed.emit()
         if not self.reconnect_timer.isActive():
-            QTimer.singleShot(0, lambda: self.reconnect_timer.start(5000)) # Try to reconnect every 5 seconds
+            QTimer.singleShot(0, lambda: self.reconnect_timer.start(5000))
 
     def _on_error(self, _, code, reason):
         """Callback for WebSocket errors."""
@@ -103,44 +110,63 @@ class MarketDataWorker(QObject):
 
     def set_instruments(self, instrument_tokens: Set[int], append: bool = False):
         """
-        Updates or appends instrument tokens for subscription.
-        If append=True, adds tokens to existing subscription instead of replacing.
+        🔥 FIXED: Updates or appends instrument tokens for subscription.
         """
         # Convert to set
         instrument_tokens_set = set(instrument_tokens)
 
-        if append:
-            instrument_tokens_set |= self.subscribed_tokens  # merge sets
+        logger.debug(f"[set_instruments] Called with {len(instrument_tokens_set)} tokens, append={append}")
 
-        if not self.is_running or not self.kws or not self.kws.is_connected():
-            logger.warning("WebSocket not connected. Storing tokens for when it connects.")
+        if append:
+            instrument_tokens_set |= self.subscribed_tokens
+
+        # 🔥 CRITICAL: Check WebSocket connection state
+        if not self.kws:
+            logger.warning("[set_instruments] KiteTicker not initialized. Storing tokens.")
             self.subscribed_tokens = instrument_tokens_set
             return
 
+        if not self.kws.is_connected():
+            logger.warning("[set_instruments] WebSocket not connected. Storing tokens for later.")
+            self.subscribed_tokens = instrument_tokens_set
+            return
+
+        # Calculate changes
         new_tokens = instrument_tokens_set
         old_tokens = self.subscribed_tokens
 
         tokens_to_add = list(new_tokens - old_tokens)
         tokens_to_remove = list(old_tokens - new_tokens) if not append else []
 
+        # 🔥 FIX: Subscribe to new tokens
         if tokens_to_add:
-            self.kws.subscribe(tokens_to_add)
-            self.kws.set_mode(self.kws.MODE_FULL, tokens_to_add)
-            logger.info(f"Subscribed to {len(tokens_to_add)} new tokens.")
+            try:
+                self.kws.subscribe(tokens_to_add)
+                self.kws.set_mode(self.kws.MODE_FULL, tokens_to_add)
+                logger.info(f"Subscribed to {len(tokens_to_add)} new tokens.")
+            except Exception as e:
+                logger.error(f"Failed to subscribe to new tokens: {e}")
+                # Don't add to subscribed_tokens if subscription failed
+                return
 
+        # 🔥 FIX: Unsubscribe from removed tokens
         if tokens_to_remove:
-            self.kws.unsubscribe(tokens_to_remove)
-            logger.info(f"Unsubscribed from {len(tokens_to_remove)} tokens.")
+            try:
+                self.kws.unsubscribe(tokens_to_remove)
+                logger.info(f"Unsubscribed from {len(tokens_to_remove)} tokens.")
+            except Exception as e:
+                logger.error(f"Failed to unsubscribe tokens: {e}")
 
+        # 🔥 CRITICAL: Update internal state AFTER successful operations
         self.subscribed_tokens = new_tokens
+
+        logger.debug(f"[set_instruments] Now tracking {len(self.subscribed_tokens)} tokens")
 
     def stop(self):
         """Stops the worker and closes the WebSocket connection."""
         logger.info("Stopping MarketDataWorker...")
-        # Disable reconnect attempts during a manual stop
         self.reconnect_timer.stop()
         self.heartbeat_timer.stop()
         if self.kws and self.is_running:
-            # The stop() method is more forceful than close() and is better for shutdown
             self.kws.stop()
         self.is_running = False

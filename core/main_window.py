@@ -270,38 +270,33 @@ class ScalperMainWindow(QMainWindow):
 
     def _on_market_data(self, data: list):
         """
-        Receives raw ticks from MarketDataWorker.
-        Stores the latest tick per instrument_token.
+        FIXED: Direct CVD processing BEFORE throttling.
+        This ensures CVD gets EVERY tick immediately.
         """
+        # 1️⃣ Feed ticks to CVD engine FIRST (non-throttled)
+        self.cvd_engine.process_ticks(data)
+
+        # 2️⃣ Then do throttled UI updates
         for tick in data:
-            token = tick.get('instrument_token')
-            if token is not None:
-                self._latest_market_data[token] = tick
+            if 'instrument_token' in tick:
+                self._latest_market_data[tick['instrument_token']] = tick
 
         self._ui_update_needed = True
 
     def _update_throttled_ui(self):
         """
         Throttled UI update loop.
-        IMPORTANT:
-        - UI is throttled
-        - Market data is NOT cleared
+        CVD is now processed in _on_market_data (non-throttled).
         """
-
         if not self._ui_update_needed:
             return
 
         # Use latest known tick per instrument
         ticks_to_process = list(self._latest_market_data.values())
-        # 🔍 DEBUG: confirm which instruments are being processed
-        logger.debug(
-            f"Processing {len(ticks_to_process)} ticks: "
-            f"{[t.get('instrument_token') for t in ticks_to_process]}"
-        )
-        # --- Core market consumers ---
+
+        # --- Core market consumers (CVD REMOVED - processed in _on_market_data) ---
         self.strike_ladder.update_prices(ticks_to_process)
         self.position_manager.update_pnl_from_market_data(ticks_to_process)
-        self.cvd_engine.process_ticks(ticks_to_process)
 
         # --- UI updates ---
         self._update_account_summary_widget()
@@ -319,9 +314,8 @@ class ScalperMainWindow(QMainWindow):
         if self.performance_dialog and self.performance_dialog.isVisible():
             self._update_performance()
 
-        # Reset UI throttle flag ONLY
+        # Reset UI throttle flag
         self._ui_update_needed = False
-
     def _apply_dark_theme(self):
         try:
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
@@ -372,8 +366,18 @@ class ScalperMainWindow(QMainWindow):
         self.instrument_loader.start()
 
         self.market_data_worker = MarketDataWorker(self.api_key, self.access_token)
-        self.market_data_worker.data_received.connect(self._on_market_data)
+        self.market_data_worker.data_received.connect(self._on_market_data,Qt.QueuedConnection)
         self.market_data_worker.connection_status_changed.connect(self._on_network_status_changed)
+        # 🔑 PRE-SUBSCRIBE CVD FUTURES (CRITICAL)
+        preload_cvd_tokens = set()
+        for sym in self.cvd_symbols:
+            fut_token = self._get_nearest_future_token(sym)
+            if fut_token:
+                preload_cvd_tokens.add(fut_token)
+                self.active_cvd_tokens.add(fut_token)
+
+        if preload_cvd_tokens:
+            self.market_data_worker.set_instruments(preload_cvd_tokens)
         self.market_data_worker.start()
 
         self.update_timer = QTimer(self)
@@ -588,12 +592,7 @@ class ScalperMainWindow(QMainWindow):
             logger.error(f"Failed to create Market Monitor dialog: {e}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Could not open Market Monitor:\n{e}")
 
-
     def _show_cvd_chart_dialog(self):
-        """
-        Opens TradingView-style CVD candlestick chart
-        for the nearest FUTURE of the current symbol.
-        """
         current_settings = self.header.get_current_settings()
         symbol = current_settings.get("symbol")
 
@@ -603,15 +602,35 @@ class ScalperMainWindow(QMainWindow):
 
         fut_token = self._get_nearest_future_token(symbol)
         if not fut_token:
-            QMessageBox.warning(
-                self,
-                "CVD Chart",
-                f"No FUT contract found for {symbol}."
-            )
+            QMessageBox.warning(self, "CVD Chart", f"No FUT contract found for {symbol}.")
             return
+
+        # Register with CVD engine
+        self.cvd_engine.register_token(fut_token)
         self.active_cvd_tokens.add(fut_token)
+
+        # Update subscriptions
         self._update_market_subscriptions()
+
+        # Wait then open dialog
+        QTimer.singleShot(500, lambda: self._open_cvd_chart_after_subscription(fut_token, symbol))
+        QTimer.singleShot(1000, self._log_active_subscriptions)
+
+    def _open_cvd_chart_after_subscription(self, fut_token: int, symbol: str):
+        """Helper to open CVD chart after subscription is confirmed."""
         try:
+            # Verify subscription happened
+            if hasattr(self.market_data_worker, 'subscribed_tokens'):
+                if fut_token not in self.market_data_worker.subscribed_tokens:
+                    logger.error(f"[CVD] Token {fut_token} NOT in subscribed_tokens!")
+                    QMessageBox.warning(
+                        self,
+                        "Subscription Failed",
+                        f"Failed to subscribe to market data for {symbol}.\n"
+                        "The chart may not update in real-time."
+                    )
+
+            # Open dialog anyway
             dlg = CVDChartDialog(
                 kite=self.real_kite_client,
                 instrument_token=fut_token,
@@ -624,6 +643,8 @@ class ScalperMainWindow(QMainWindow):
             dlg.raise_()
             dlg.activateWindow()
 
+            logger.info(f"[CVD] Chart opened for token {fut_token}")
+
         except Exception as e:
             logger.error("Failed to open CVD Chart dialog", exc_info=True)
             QMessageBox.critical(
@@ -632,10 +653,24 @@ class ScalperMainWindow(QMainWindow):
                 f"Failed to open CVD chart:\n{e}"
             )
 
+    def _log_active_subscriptions(self):
+        """Diagnostic method to verify CVD tokens are subscribed."""
+        if hasattr(self, 'market_data_worker'):
+            # FIX: Use 'subscribed_tokens' not '_subscribed_tokens'
+            active_tokens = self.market_data_worker.subscribed_tokens  # No underscore!
+            cvd_tokens = self.active_cvd_tokens
 
-    def _on_cvd_dialog_closed(self, token: int):
-        self.active_cvd_tokens.discard(token)
-        self._update_market_subscriptions()
+            logger.info(f"[CVD] Active CVD tokens: {cvd_tokens}")
+            logger.info(f"[CVD] Subscribed tokens: {len(active_tokens)}")
+
+            missing = cvd_tokens - active_tokens
+            if missing:
+                logger.warning(f"[CVD] Tokens NOT subscribed: {missing}")
+            else:
+                logger.info(f"[CVD] All CVD tokens properly subscribed ✓")
+
+    def _on_cvd_dialog_closed(self, token):
+        QTimer.singleShot(0, self._update_market_subscriptions)
 
     def _show_cvd_market_monitor_dialog(self):
         symbol_to_token = {}
@@ -654,7 +689,6 @@ class ScalperMainWindow(QMainWindow):
 
         dlg = CVDMarketMonitorDialog(
             kite=self.real_kite_client,
-            cvd_engine=self.cvd_engine,
             symbol_to_token=symbol_to_token,
             parent=self
         )
@@ -2021,9 +2055,10 @@ class ScalperMainWindow(QMainWindow):
         realized_pnl = self.position_manager.get_realized_day_pnl()
 
         try:
-            margins = self.trader.margins().get("equity", {})
-        except Exception:
-            margins = {}
+            margins = self.trader.margins()
+        except Exception as e:
+            logger.warning(f"Margins fetch failed: {e}")
+            return
 
         used_margin = margins.get("utilised", {}).get("total", 0.0)
         available_margin = margins.get("available", {}).get("live_balance", 0.0)

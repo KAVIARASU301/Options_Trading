@@ -6,13 +6,24 @@ from PySide6.QtWidgets import (
     QSpinBox, QGroupBox, QRadioButton, QButtonGroup, QFrame, QAbstractSpinBox
 )
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QCursor
+from PySide6.QtGui import QCursor, QFont
 from kiteconnect import KiteConnect
+from PySide6.QtCore import QPropertyAnimation, QEasingCurve
+from PySide6.QtWidgets import QGraphicsOpacityEffect
 
 from utils.data_models import OptionType, Contract
 import locale
 locale.setlocale(locale.LC_ALL, 'en_IN')
 logger = logging.getLogger(__name__)
+
+# -------------------------------------------------
+# Unified UI fonts
+# -------------------------------------------------
+UI_INFO_FONT = QFont("Segoe UI", 12)
+UI_INFO_FONT.setWeight(QFont.Normal)
+
+UI_SPIN_FONT = QFont("Segoe UI", 10)
+UI_SPIN_FONT.setWeight(QFont.Normal)
 
 
 class ClickableLabel(QLabel):
@@ -50,6 +61,8 @@ class BuyExitPanel(QWidget):
         self._setup_ui()
         self._apply_styles()
         self._update_ui_for_option_type()
+
+
 
     def _setup_ui(self):
         self.setObjectName("buyExitPanel")
@@ -103,6 +116,7 @@ class BuyExitPanel(QWidget):
         spinbox.setRange(0, 10)
         spinbox.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         spinbox.setAlignment(Qt.AlignCenter)
+        spinbox.setFont(UI_SPIN_FONT)
         spinbox.valueChanged.connect(self._update_margin)
         return spinbox
 
@@ -137,13 +151,18 @@ class BuyExitPanel(QWidget):
 
         strikes_title_label = QLabel("Total Strikes")
         lots_title_label = QLabel("Lots × Qty")
+        strikes_title_label.setObjectName("infoTitle")
+        lots_title_label.setObjectName("infoTitle")
 
         layout.addWidget(strikes_title_label, 0, 0, Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(lots_title_label, 0, 1, Qt.AlignmentFlag.AlignCenter)
 
         self.total_contracts_value_label = QLabel("0")
+        self.total_contracts_value_label.setFont(UI_INFO_FONT)
         self.total_contracts_value_label.setObjectName("infoValue")
+
         self.lot_info_label = QLabel("0 × 0")
+        self.lot_info_label.setFont(UI_INFO_FONT)
         self.lot_info_label.setObjectName("infoValue")
 
         layout.addWidget(self.total_contracts_value_label, 1, 0, Qt.AlignmentFlag.AlignCenter)
@@ -155,9 +174,14 @@ class BuyExitPanel(QWidget):
         layout.addWidget(divider, 2, 0, 1, 2)
 
         layout.addWidget(QLabel("Estimated Premium"), 3, 0, 1, 2, Qt.AlignmentFlag.AlignCenter)
-        self.margin_label = QLabel("₹0")
+        self.margin_label = QLabel()
         self.margin_label.setObjectName("marginValue")
+        self.margin_label.setTextFormat(Qt.RichText)
+        self.margin_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.margin_label, 4, 0, 1, 2, Qt.AlignmentFlag.AlignCenter)
+        # --- Margin animation setup (safe: margin_label exists here) ---
+        self._last_margin_value = None
+        self._setup_margin_animation()
 
         return info_frame
 
@@ -185,7 +209,7 @@ class BuyExitPanel(QWidget):
                                                   stop:0 #2A3140, stop:1 #161A25);
                 border: 1px solid #3A4458;
                 border-radius: 12px;
-                font-family: "Segoe UI", sans-serif;
+                font-family: 'Segoe UI', 'Roboto Mono', monospace;
             }
             #panelTitleCall, #panelTitlePut {
                 font-size: 22px; font-weight: 600; padding: 6px;
@@ -205,15 +229,21 @@ class BuyExitPanel(QWidget):
                 font-size: 11px; margin-top: 8px; padding-top: 12px; font-weight: bold;
             }
             #selectionGroup::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
+            #infoTitle {font-size: 12px;color: #A9B1C3;}
             #infoFrame { background-color: rgba(13, 17, 23, 0.5); border-radius: 8px; }
             #divider { background-color: #3A4458; height: 1px; border: none; }
-            QLabel { color: #A9B1C3; font-size: 12px; }
-            #infoValue { color: #E0E0E0; font-size: 16px; font-weight: 600; }
-            #marginValue { color: #FFFFFF; font-size: 24px; font-weight: 300; }
+            QLabel { color: #A9B1C3;  }
+            #infoValue { color: #E0E0E0; }
+            #marginValue { color: #FFFFFF; }
+            
             QSpinBox {
-                background-color: #212635; color: #E0E0E0; border: 1px solid #3A4458;
-                border-radius: 6px; font-size: 14px; padding: 2px; font-weight: 600;
+                background-color: #212635;
+                color: #E0E0E0;
+                border: 1px solid #3A4458;
+                border-radius: 6px;
+                padding: 2px;
             }
+
             QSpinBox:focus { border-color: #29C7C9; }
             QRadioButton { color: #A9B1C3; spacing: 5px; font-weight: bold; }
             QRadioButton::indicator {
@@ -291,7 +321,20 @@ class BuyExitPanel(QWidget):
 
         total_premium = int(sum(s['ltp'] * self.lot_size * self.lot_quantity for s in strikes))
         formatted_value = locale.format_string("%d", total_premium, grouping=True)
-        self.margin_label.setText(f"₹ {formatted_value}")
+
+        html = (
+            "<span style='font-size:14px; vertical-align:top;'>₹</span> "
+            f"<span style='font-family:\"Segoe UI\",\"Roboto Mono\",monospace; "
+            f"font-size:20px; font-weight:500;'>{formatted_value}</span>"
+        )
+
+        self.margin_label.setText(html)
+
+        if self._last_margin_value != total_premium:
+            self._margin_anim.stop()
+            self._margin_anim.start()
+
+        self._last_margin_value = total_premium
 
     def update_parameters(self, symbol: str, lot_size: int, lot_quantity: int, expiry: str):
         self.current_symbol = symbol
@@ -354,3 +397,13 @@ class BuyExitPanel(QWidget):
                 if contract:
                     strikes.append({"strike": data['strike'], "ltp": contract.ltp, "contract": contract})
         return strikes
+
+    def _setup_margin_animation(self):
+        self._margin_opacity = QGraphicsOpacityEffect(self.margin_label)
+        self.margin_label.setGraphicsEffect(self._margin_opacity)
+
+        self._margin_anim = QPropertyAnimation(self._margin_opacity, b"opacity", self)
+        self._margin_anim.setDuration(220)
+        self._margin_anim.setStartValue(0.4)
+        self._margin_anim.setEndValue(1.0)
+        self._margin_anim.setEasingCurve(QEasingCurve.OutCubic)

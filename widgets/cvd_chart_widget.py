@@ -1,6 +1,6 @@
 import pyqtgraph as pg
 import pandas as pd
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QHBoxLayout, QPushButton
@@ -12,21 +12,24 @@ from core.cvd.cvd_historical import CVDHistoricalBuilder
 
 class CVDChartWidget(QWidget):
     """
-    CVD Chart Widget (Market Monitor Style)
+    CVD Chart Widget (Market Monitor / Dashboard Style)
 
-    Default view:
-    - Previous day visually shifted so its close = 0
-    - Today starts naturally from 0 (true session CVD)
-
-    Toggle:
-    - Session CVD (raw, no visual shift)
+    • Historical minute candles only
+    • Refreshes every 3 seconds
+    • Rebased / Session toggle
+    • Moving dot with momentum-based color
     """
+
+    REFRESH_INTERVAL_MS = 3000  # 3 seconds
+
+    COLOR_UP = "#26A69A"     # green
+    COLOR_DOWN = "#EF5350"   # red
+    COLOR_FLAT = "#8A9BA8"   # grey
 
     def __init__(
         self,
         kite,
         instrument_token,
-        cvd_engine,
         symbol: str,
         parent=None
     ):
@@ -34,21 +37,17 @@ class CVDChartWidget(QWidget):
 
         self.kite = kite
         self.instrument_token = instrument_token
-        self.cvd_engine = cvd_engine
         self.symbol = symbol
 
-        self.engine_symbol = None
         self.cvd_df = None
         self.prev_day_close_cvd = 0.0
-
-        # default = visual rebased
         self.rebased_mode = True
 
         self.axis = pg.AxisItem(orientation="bottom")
 
         self._setup_ui()
         self._load_historical()
-        self._start_live_updates()
+        self._start_refresh_timer()
 
     # ------------------------------------------------------------------
     # UI
@@ -109,6 +108,14 @@ class CVDChartWidget(QWidget):
         self.plot.getAxis("left").setPen(axis_pen)
         self.plot.getAxis("bottom").setPen(axis_pen)
 
+        # Moving dot (color updated dynamically)
+        self.end_dot = pg.ScatterPlotItem(
+            size=6,
+            brush=pg.mkBrush(self.COLOR_FLAT),
+            pen=pg.mkPen(None)
+        )
+        self.plot.addItem(self.end_dot)
+
         root.addWidget(self.plot)
 
     # ------------------------------------------------------------------
@@ -116,19 +123,17 @@ class CVDChartWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _load_historical(self):
-        # ---- AUTH GUARD (CRITICAL) ----
         if not self.kite or not getattr(self.kite, "access_token", None):
-            # Paper mode OR expired session → skip historical safely
             return
 
         try:
-            to_date = datetime.now()
-            from_date = to_date - timedelta(days=2)
+            to_dt = datetime.now()
+            from_dt = to_dt - timedelta(days=2)
 
             hist = self.kite.historical_data(
                 self.instrument_token,
-                from_date,
-                to_date,
+                from_dt,
+                to_dt,
                 interval="minute"
             )
 
@@ -157,11 +162,10 @@ class CVDChartWidget(QWidget):
             self._plot()
 
         except Exception:
-            # Never crash Market Monitor widgets
             pass
 
     # ------------------------------------------------------------------
-    # Plotting (CORRECT SCALE LOGIC)
+    # Plotting + Momentum Dot
     # ------------------------------------------------------------------
 
     def _plot(self):
@@ -170,17 +174,18 @@ class CVDChartWidget(QWidget):
 
         self.plot.clear()
         self.plot.addItem(self.zero_line)
+        self.plot.addItem(self.end_dot)
 
         sessions = sorted(self.cvd_df["session"].unique())
         all_times = list(self.cvd_df.index)
 
         x_offset = 0
+        last_two_y = []
 
         for i, sess in enumerate(sessions):
             df_sess = self.cvd_df[self.cvd_df["session"] == sess]
             y_raw = df_sess["close"].values
 
-            # 🔑 FIX: shift ONLY previous day
             if self.rebased_mode and i == 0 and len(sessions) == 2:
                 y = y_raw - self.prev_day_close_cvd
             else:
@@ -195,7 +200,29 @@ class CVDChartWidget(QWidget):
             )
 
             self.plot.addItem(pg.PlotCurveItem(x, y, pen=pen))
+
+            if i == len(sessions) - 1 and len(y) >= 2:
+                last_two_y = y[-2:].tolist()
+                last_x = x[-1]
+                last_y = y[-1]
+
             x_offset += len(y)
+
+        # --- Momentum logic ---
+        if len(last_two_y) == 2:
+            prev_y, curr_y = last_two_y
+
+            if curr_y > prev_y:
+                color = self.COLOR_UP
+            elif curr_y < prev_y:
+                color = self.COLOR_DOWN
+            else:
+                color = self.COLOR_FLAT
+
+            self.end_dot.setBrush(pg.mkBrush(color))
+            self.end_dot.setData([last_x], [last_y])
+        else:
+            self.end_dot.clear()
 
         def time_formatter(values, *_):
             out = []
@@ -214,54 +241,13 @@ class CVDChartWidget(QWidget):
         self.plot.setXRange(0, x_offset, padding=0.02)
 
     # ------------------------------------------------------------------
-    # Live updates
+    # Timer
     # ------------------------------------------------------------------
 
-    def _start_live_updates(self):
+    def _start_refresh_timer(self):
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self._update_live)
-        self.timer.start(500)
-
-    def _resolve_engine_symbol(self):
-        if self.engine_symbol:
-            return
-
-        base = self.symbol.split()[0]
-        for sym in self.cvd_engine.snapshot().keys():
-            if sym.startswith(base) and sym.endswith("FUT"):
-                self.engine_symbol = sym
-                break
-
-    def _update_live(self):
-        if self.cvd_df is None:
-            return
-
-        self._resolve_engine_symbol()
-        if not self.engine_symbol:
-            return
-
-        live_cvd = self.cvd_engine.get_cvd(self.engine_symbol)
-        if live_cvd is None:
-            return
-
-        today = date.today()
-
-        if today not in self.cvd_df["session"].values:
-            ts = datetime.now()
-            self.cvd_df.loc[ts] = {
-                "open": live_cvd,
-                "high": live_cvd,
-                "low": live_cvd,
-                "close": live_cvd,
-                "session": today,
-            }
-        else:
-            idx = self.cvd_df[self.cvd_df["session"] == today].index[-1]
-            self.cvd_df.at[idx, "close"] = live_cvd
-            self.cvd_df.at[idx, "high"] = max(self.cvd_df.at[idx, "high"], live_cvd)
-            self.cvd_df.at[idx, "low"] = min(self.cvd_df.at[idx, "low"], live_cvd)
-
-        self._plot()
+        self.timer.timeout.connect(self._load_historical)
+        self.timer.start(self.REFRESH_INTERVAL_MS)
 
     # ------------------------------------------------------------------
     # Toggle
@@ -278,3 +264,12 @@ class CVDChartWidget(QWidget):
             self.title_label.setText(self.symbol)
 
         self._plot()
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+
+    def closeEvent(self, event):
+        if hasattr(self, "timer"):
+            self.timer.stop()
+        super().closeEvent(event)

@@ -3,73 +3,83 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 import pyqtgraph as pg
-from PySide6.QtWidgets import QDialog, QVBoxLayout
+from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QHBoxLayout
 from PySide6.QtCore import Qt, QTimer
 from pyqtgraph import AxisItem
 
 from kiteconnect import KiteConnect
 
 from core.cvd.cvd_historical import CVDHistoricalBuilder
-from core.cvd.cvd_engine import CVDEngine
 
 logger = logging.getLogger(__name__)
 
 
 class CVDChartDialog(QDialog):
     """
-    CVD Chart Dialog
-    - Previous day: grey, non-continuous
-    - Current day: green
-    - Adaptive time axis
-    - Live updates
+    Historical CVD Chart with 1-minute auto-refresh
+
+    - Previous day: grey, dashed
+    - Current day: solid green
+    - Auto-refreshes every 1 minute
     """
 
+    REFRESH_INTERVAL_MS =3000  # 1 minute
+
     def __init__(
-        self,
-        kite: KiteConnect,
-        instrument_token: int,
-        symbol: str,
-        cvd_engine: CVDEngine,
-        parent=None,
+            self,
+            kite: KiteConnect,
+            instrument_token: int,
+            symbol: str,
+            cvd_engine=None,  # Not used anymore, kept for compatibility
+            parent=None,
     ):
         super().__init__(parent)
 
         self.kite = kite
         self.instrument_token = instrument_token
         self.symbol = symbol
-        self.cvd_engine = cvd_engine
 
-        self.engine_symbol = None
-        self.cvd_df: pd.DataFrame | None = None
-
-        self.setWindowTitle(f"CVD – {symbol}")
+        self.setWindowTitle(f"CVD — {symbol}")
         self.setMinimumSize(900, 520)
-
         self.setWindowFlags(
-            Qt.Window |
-            Qt.WindowMinimizeButtonHint |
-            Qt.WindowMaximizeButtonHint |
-            Qt.WindowCloseButtonHint
+            Qt.Window
+            | Qt.WindowMinimizeButtonHint
+            | Qt.WindowMaximizeButtonHint
+            | Qt.WindowCloseButtonHint
         )
 
         self._setup_ui()
-        self._load_historical()
-        self._start_live_timer()
+        self._load_and_plot()
+        self._start_refresh_timer()
 
     # ------------------------------------------------------------------
 
     def _setup_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(4)
 
+        # Status bar at top
+        status_layout = QHBoxLayout()
+        self.status_label = QLabel("Loading...")
+        self.status_label.setStyleSheet("""
+            QLabel {
+                color: #8A9BA8;
+                font-size: 11px;
+                padding: 4px 8px;
+            }
+        """)
+        status_layout.addWidget(self.status_label)
+        status_layout.addStretch()
+        main_layout.addLayout(status_layout)
+
+        # Chart
         self.axis = AxisItem(orientation="bottom")
-
         self.plot = pg.PlotWidget(axisItems={"bottom": self.axis})
         self.plot.setBackground("#161A25")
         self.plot.showGrid(x=True, y=True, alpha=0.12)
-
         self.plot.setMenuEnabled(False)
-        self.plot.setMouseEnabled(x=False, y=True)
+        self.plot.setMouseEnabled(x=True, y=True)
 
         axis_pen = pg.mkPen("#8A9BA8")
         for a in ("left", "bottom"):
@@ -78,21 +88,36 @@ class CVDChartDialog(QDialog):
             ax.setTextPen(axis_pen)
             ax.setStyle(tickTextOffset=8)
 
-        layout.addWidget(self.plot)
+        main_layout.addWidget(self.plot)
 
+        # Zero line
         zero_pen = pg.mkPen("#6C7386", style=Qt.DashLine, width=1)
-        self.zero_line = pg.InfiniteLine(0, angle=0, pen=zero_pen)
-        self.plot.addItem(self.zero_line)
+        self.plot.addItem(pg.InfiniteLine(0, angle=0, pen=zero_pen))
+
+        # Curves
+        self.prev_curve = pg.PlotCurveItem(
+            pen=pg.mkPen("#7A7A7A", width=2, style=Qt.DashLine),
+            antialias=True,
+        )
+        self.today_curve = pg.PlotCurveItem(
+            pen=pg.mkPen("#26A69A", width=2.5),
+            antialias=True,
+        )
+
+        self.plot.addItem(self.prev_curve)
+        self.plot.addItem(self.today_curve)
 
     # ------------------------------------------------------------------
 
-    def _load_historical(self):
-        # ---- AUTH GUARD (IMPORTANT) ----
+    def _load_and_plot(self):
+        """Load historical data and plot CVD."""
         if not self.kite or not getattr(self.kite, "access_token", None):
-            logger.error("CVD chart: Kite client not authenticated, skipping historical load")
+            self.status_label.setText("⚠️ No API connection")
             return
 
         try:
+            self.status_label.setText("Loading data...")
+
             to_date = datetime.now()
             from_date = to_date - timedelta(days=2)
 
@@ -104,125 +129,100 @@ class CVDChartDialog(QDialog):
             )
 
             if not hist:
+                self.status_label.setText("⚠️ No data available")
                 return
 
             df = pd.DataFrame(hist)
             df["date"] = pd.to_datetime(df["date"])
             df.set_index("date", inplace=True)
 
+            # Build CVD
             cvd_df = CVDHistoricalBuilder.build_cvd_ohlc(df)
-
-            # Keep only previous + current session
             cvd_df["session"] = cvd_df.index.date
+
+            # Get last 2 sessions
             sessions = sorted(cvd_df["session"].unique())[-2:]
-            cvd_df = cvd_df[cvd_df["session"].isin(sessions)]
+            plot_df = cvd_df[cvd_df["session"].isin(sessions)]
 
-            self.cvd_df = cvd_df
-            self._plot()
+            # Plot
+            self._plot_data(plot_df)
 
-        except Exception:
-            logger.exception("Failed to load CVD chart")
+            # Update status
+            last_time = plot_df.index[-1].strftime("%H:%M:%S")
+            last_cvd = plot_df["close"].iloc[-1]
+            self.status_label.setText(
+                f"✓ Last update: {last_time} | CVD: {last_cvd:,.0f}"
+            )
+
+            logger.info(f"CVD chart updated for {self.symbol}")
+
+        except Exception as e:
+            logger.exception("Failed to load/plot CVD")
+            self.status_label.setText(f"⚠️ Error: {str(e)[:50]}")
 
     # ------------------------------------------------------------------
 
-    def _plot(self):
-        if self.cvd_df is None or self.cvd_df.empty:
+    def _plot_data(self, cvd_df: pd.DataFrame):
+        """Plot CVD data."""
+        if cvd_df is None or cvd_df.empty:
             return
 
-        self.plot.clear()
-        self.plot.addItem(self.zero_line)
-
-        sessions = sorted(self.cvd_df["session"].unique())
-        timestamps = list(self.cvd_df.index)
-
-        x_offset = 0
+        x = 0
         all_times = []
 
-        for i, sess in enumerate(sessions):
-            df_sess = self.cvd_df[self.cvd_df["session"] == sess]
+        for i, session in enumerate(sorted(cvd_df["session"].unique())):
+            df_sess = cvd_df[cvd_df["session"] == session]
             y = df_sess["close"].values
-            x = list(range(x_offset, x_offset + len(y)))
+            xs = list(range(x, x + len(y)))
 
             all_times.extend(df_sess.index)
 
-            pen = (
-                pg.mkPen("#7A7A7A", width=2)  # previous day
-                if i == 0 and len(sessions) == 2
-                else pg.mkPen("#26A69A", width=2.5)  # today
-            )
+            # Previous day vs today
+            if i == 0 and len(cvd_df["session"].unique()) == 2:
+                self.prev_curve.setData(xs, y)
+            else:
+                self.today_curve.setData(xs, y)
 
-            self.plot.addItem(
-                pg.PlotCurveItem(
-                    x,
-                    y,
-                    pen=pen,
-                    antialias=True,
-                    skipFiniteCheck=True,
-                )
-            )
+            x += len(y)
 
-            x_offset += len(y)
-
-        # ---- Adaptive time axis ----
+        # Time axis formatter
         def time_formatter(values, *_):
             labels = []
             total = len(all_times)
-
-            # dynamic step
-            if total <= 300:
-                step = 15
-            elif total <= 600:
-                step = 30
-            else:
-                step = 60
+            step = 15 if total <= 300 else 30 if total <= 600 else 60
 
             for v in values:
                 idx = int(v)
                 if 0 <= idx < total:
                     ts = all_times[idx]
-                    if ts.minute % step == 0:
-                        labels.append(ts.strftime("%H:%M"))
-                    else:
-                        labels.append("")
+                    labels.append(
+                        ts.strftime("%H:%M") if ts.minute % step == 0 else ""
+                    )
                 else:
                     labels.append("")
             return labels
 
         self.axis.tickStrings = time_formatter
 
+        # Auto-range
+        self.plot.setXRange(0, x, padding=0.02)
         self.plot.enableAutoRange(axis=pg.ViewBox.YAxis)
-        self.plot.setXRange(0, x_offset, padding=0.02)
 
     # ------------------------------------------------------------------
 
-    def _start_live_timer(self):
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self._update_live)
-        self.timer.start(500)
+    def _start_refresh_timer(self):
+        """Start 1-minute auto-refresh."""
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self._load_and_plot)
+        self.refresh_timer.start(self.REFRESH_INTERVAL_MS)
+
+        logger.info(f"CVD auto-refresh started (every 1s)")
 
     # ------------------------------------------------------------------
 
-    def _update_live(self):
-        if self.cvd_df is None or self.cvd_df.empty:
-            return
-
-        if self.engine_symbol is None:
-            base = self.symbol.split()[0]
-            for sym in self.cvd_engine.snapshot():
-                if sym.startswith(base) and sym.endswith("FUT"):
-                    self.engine_symbol = sym
-                    break
-
-        if not self.engine_symbol:
-            return
-
-        live_cvd = self.cvd_engine.get_cvd(self.engine_symbol)
-        if live_cvd is None:
-            return
-
-        idx = self.cvd_df.index[-1]
-        self.cvd_df.at[idx, "close"] = live_cvd
-        self.cvd_df.at[idx, "high"] = max(self.cvd_df.at[idx, "high"], live_cvd)
-        self.cvd_df.at[idx, "low"] = min(self.cvd_df.at[idx, "low"], live_cvd)
-
-        self._plot()
+    def closeEvent(self, event):
+        """Cleanup on close."""
+        if hasattr(self, 'refresh_timer'):
+            self.refresh_timer.stop()
+        logger.info(f"CVD chart closed for {self.symbol}")
+        super().closeEvent(event)

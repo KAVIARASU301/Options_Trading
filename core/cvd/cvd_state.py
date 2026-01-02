@@ -12,13 +12,11 @@ class CVDState:
     This is intentionally UI-agnostic.
     """
 
-    symbol: str
+    instrument_token: int
     cvd: float = 0.0
-
-    last_price: Optional[float] = None
-    last_volume: Optional[int] = None
-
-    session_date: Optional[date] = None
+    last_price: float | None = None
+    last_volume: int | None = None
+    session_date: date | None = None
 
     def reset_session(self, new_date: date):
         """Reset CVD at the start of a new session."""
